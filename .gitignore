@@ -1,0 +1,9 @@
+__pycache__
+.conda
+.vscode
+logs
+AFA_EC2.def
+afa_env.sif
+*.png
+archive
+pretrain_eval_outputs
