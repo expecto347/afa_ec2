@@ -206,46 +206,11 @@ class EC2Estimator(pl.LightningModule):
         image_acc = ((mu - x).abs() < tolerance).all(dim=1).float().mean()
         return pixel_acc, image_acc
 
-    def estimate_class_frequency_mc(self, x, mask, pred_aux_det):
+    def estimate_class_frequency_mc(self, x, mask):
         with torch.no_grad():
-            mu, logvar = pred_aux_det
-            num_mc = self.mc_samples
-            batch_size, num_features = x.shape
-
-            # 【修改点】：真正的蒙特卡洛重参数化采样
-            mean_features = mu.unsqueeze(0).expand(num_mc, -1, -1)
-            # 计算标准差: std = exp(0.5 * logvar)
-            std_features = torch.exp(0.5 * logvar).unsqueeze(0).expand(num_mc, -1, -1)
-            
-            # 采样: z = mu + std * epsilon (其中 epsilon ~ N(0, 1))
-            noise = torch.randn_like(mean_features)
-            sampled_features = mean_features + noise * std_features
-
-            x_expanded = x.unsqueeze(0)
-            mask_expanded = mask.unsqueeze(0)
-            x_completed = mask_expanded * x_expanded + (1 - mask_expanded) * sampled_features
-            x_completed = x_completed.reshape(num_mc * batch_size, num_features)
-
-            full_mask = torch.ones(
-                num_mc * batch_size,
-                self.mask_size,
-                dtype=mask.dtype,
-                device=mask.device,
-            )
-
-            if getattr(self.mask_layer, "append", False):
-                predictor_input = torch.cat([x_completed, full_mask], dim=1)
-            else:
-                predictor_input = self.mask_layer(x_completed, full_mask)
-
-            pred_main_samples, _ = self.predictor(predictor_input)
-
-            num_classes = pred_main_samples.shape[1]
-            pred_labels = torch.argmax(pred_main_samples, dim=1)
-            one_hot = nn.functional.one_hot(pred_labels, num_classes=num_classes).float()
-            class_frequency = one_hot.reshape(num_mc, batch_size, num_classes).mean(dim=0)
-
-        return class_frequency
+            x_masked = self.mask_layer(x, mask)
+            main_out, _ = self.predictor(x_masked)
+            return main_out.softmax(dim=1)
 
     def training_step(self, batch, batch_idx):
         opt = self.optimizers()
@@ -283,7 +248,7 @@ class EC2Estimator(pl.LightningModule):
         pred_loss_total += pred_loss.detach()
         self.manual_backward(pred_loss / (self.max_features + 1))
 
-        p_curr = self.estimate_class_frequency_mc(x, mask, pred_aux_det)
+        p_curr = self.estimate_class_frequency_mc(x, mask)
         v_curr = 1 - torch.sum(p_curr ** 2, dim=1)
         pred_aux_old_det = pred_aux_det
 
@@ -313,7 +278,7 @@ class EC2Estimator(pl.LightningModule):
             aux_pixel_acc_total += aux_pixel_acc.detach()
             aux_image_acc_total += aux_image_acc.detach()
 
-            p_next = self.estimate_class_frequency_mc(x, mask, pred_aux_det)
+            p_next = self.estimate_class_frequency_mc(x, mask)
             v_next = 1 - torch.sum(p_next ** 2, dim=1)
 
             batch_indices = torch.arange(len(x), device=x.device)
@@ -376,7 +341,7 @@ class EC2Estimator(pl.LightningModule):
         pred_aux_det = (pred_aux[0].detach(), pred_aux[1].detach())
         
         aux_pixel_acc, aux_image_acc = self._aux_reconstruction_accuracy(pred_aux_det, x)
-        pred_list = [self.estimate_class_frequency_mc(x, mask, pred_aux_det)]
+        pred_list = [self.estimate_class_frequency_mc(x, mask)]
 
         for _ in range(self.max_features):
             x_masked = self.mask_layer(x, mask)
@@ -386,10 +351,7 @@ class EC2Estimator(pl.LightningModule):
             best_feature_index = torch.argmax(pred_ec2 / self.feature_costs, dim=1)
             mask = torch.max(mask, ind_to_onehot(best_feature_index, self.mask_size))
 
-            x_masked = self.mask_layer(x, mask)
-            _, pred_aux = self.predictor(x_masked)
-            pred_aux_det = (pred_aux[0].detach(), pred_aux[1].detach())
-            pred_list.append(self.estimate_class_frequency_mc(x, mask, pred_aux_det))
+            pred_list.append(self.estimate_class_frequency_mc(x, mask))
 
         out = {
             "pred_list": pred_list,
