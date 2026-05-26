@@ -75,6 +75,7 @@ def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout):
         lr=1e-3,
         max_features=max_features,
         eps=0.1,
+        strict=False,
     ).to(device)
 
     model.eval()

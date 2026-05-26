@@ -98,6 +98,9 @@ def parse_args():
     parser.add_argument("--pretrain_only", action="store_true")
     parser.add_argument("--disable_early_stopping", action="store_true")
     parser.add_argument("--k", type=int, default=50, help="Number of kNN neighbors")
+    parser.add_argument("--knn_subsample", type=int, default=None,
+                        help="Cap X_train reference set for kNN to this many samples "
+                             "(reduces the [B,N,d] distance tensor when N is large)")
     parser.add_argument("--patience", type=int, default=20)
     return parser.parse_args()
 
@@ -132,6 +135,10 @@ def main():
     y_train_tensor = torch.tensor(y_raw)
     feat_thresholds = compute_feature_thresholds(X_train_tensor)
 
+    counts = np.bincount(y_raw)
+    class_weights = torch.tensor(len(y_raw) / (len(counts) * counts), dtype=torch.float32)
+    print(f"Class weights: {class_weights.tolist()}")
+
     train_data = TabularDataset(args.train_csv, args.label_col, mean=feat_mean, std=feat_std)
     val_data   = TabularDataset(args.val_csv,   args.label_col, mean=feat_mean, std=feat_std)
 
@@ -162,7 +169,7 @@ def main():
     )
 
     print("Pretraining Predictor...")
-    pred_pretrainer = PredictorPretrainer(predictor, mask_layer, lr=1e-3)
+    pred_pretrainer = PredictorPretrainer(predictor, mask_layer, lr=1e-3, class_weights=class_weights)
     pred_logger = TensorBoardLogger(args.log_dir, name=args.run_name, version="pretrain_predictor")
     pred_callbacks = [TQDMProgressBar(refresh_rate=50)]
     if not args.disable_early_stopping:
@@ -187,15 +194,17 @@ def main():
         feat_mean=feat_mean,
         feat_std=feat_std,
         k=args.k,
+        knn_subsample=args.knn_subsample,
         lr=1e-3, min_lr=1e-6,
         max_features=max_features, eps=0.1,
         patience=args.patience,
         disable_early_stopping=args.disable_early_stopping,
+        val_monitor='auroc',
     )
 
     logger = TensorBoardLogger(args.log_dir, name=args.run_name, version="ec2_train")
     checkpoint_callback = ModelCheckpoint(
-        save_top_k=1, monitor="Acc Val/Predictor Mean", mode="max",
+        save_top_k=1, monitor="AUROC Val/Predictor Mean", mode="max",
         filename="best_val_perf_model", verbose=False,
     )
 

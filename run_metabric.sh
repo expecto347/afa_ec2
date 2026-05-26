@@ -14,10 +14,10 @@
 cd ~/AFA_EC2
 
 apptainer exec --nv afa_env.sif python -u ec2_sefa.py \
-    --dataset metabric --run_name ec2_metabric_trial_6 --patience 20 \
-    --k 15 --pretrain_epochs 100 --dropout 0.0 --random_first_step
+    --dataset metabric --run_name ec2_metabric_seed2 --patience 20 \
+    --k 15 --pretrain_epochs 100 --dropout 0.0 --random_first_step --train_epochs 300 --seed 2
 
-CKPT_DIR="logs/ec2_metabric_trial_6/ec2_train/checkpoints"
+CKPT_DIR="logs/ec2_metabric_seed2/ec2_train/checkpoints"
 CKPT=$(ls -t "${CKPT_DIR}"/best_val_perf_model*.ckpt 2>/dev/null | head -1)
 
 if [ -z "$CKPT" ]; then

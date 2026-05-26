@@ -52,6 +52,9 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
         nn.Linear(HIDDEN, D_IN),
     )
 
+    # strict=False: global_ec2_cache and left_float_train are registered as buffers
+    # in on_fit_start() (not __init__), so they exist in the saved state_dict but
+    # are not pre-registered at load time.
     model = EC2Estimator.load_from_checkpoint(
         checkpoint_path,
         value_network=value_network,
@@ -65,6 +68,7 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
         lr=1e-3,
         max_features=D_IN,
         eps=0.0,
+        strict=False,
     ).to(device)
     model.eval()
 
@@ -72,6 +76,8 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
     all_preds_ec2  = [[] for _ in range(max_budget + 1)]
     all_preds_rand = [[] for _ in range(max_budget + 1)]
     all_y = []
+    # selection_counts[feat, step-1] = number of times feat was chosen at that step
+    selection_counts = np.zeros((D_IN, max_budget), dtype=np.int64)
 
     print("Evaluating...")
     with torch.no_grad():
@@ -93,6 +99,10 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
                 scores = model.value_network(x_masked_ec2)
                 scores += 1e6 * mask_ec2                      # penalize already-acquired
                 best = torch.argmin(scores, dim=1)
+                # record selection counts
+                best_np = best.cpu().numpy()
+                for feat_idx in best_np:
+                    selection_counts[feat_idx, step - 1] += 1
                 upd = torch.zeros_like(mask_ec2)
                 upd.scatter_(1, best.unsqueeze(1), 1.0)
                 mask_ec2 = torch.max(mask_ec2, upd)
@@ -125,10 +135,9 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
         acc_rand = accuracy_score(y_true, p_rand)
         ec2_accs.append(acc_ec2)
         rand_accs.append(acc_rand)
-        if budget in BENCHMARK_BUDGETS:
-            print(f"{budget:<10} | {acc_ec2:<12.4f} | {acc_rand:<12.4f}")
+        print(f"{budget:<10} | {acc_ec2:<12.4f} | {acc_rand:<12.4f}")
 
-    # Plot
+    # Accuracy plot
     budgets = list(range(max_budget + 1))
     plt.figure(figsize=(8, 5))
     plt.plot(budgets, ec2_accs,  marker="o", label="EC2 (kNN)")
@@ -142,6 +151,40 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
     plt.tight_layout()
     plt.savefig(output_plot, dpi=150)
     print(f"\nPlot saved to {output_plot}")
+
+    # Feature selection heatmap
+    # Normalize each step column so values are fractions [0, 1]
+    step_totals = selection_counts.sum(axis=0, keepdims=True).clip(min=1)
+    sel_freq = selection_counts / step_totals  # shape: (D_IN, max_budget)
+
+    # Only keep features that are ever selected (non-zero rows) for readability
+    active_rows = np.where(sel_freq.sum(axis=1) > 0)[0]
+    sel_freq_active = sel_freq[active_rows]
+
+    fig, ax = plt.subplots(figsize=(max(8, max_budget * 0.6), max(6, len(active_rows) * 0.22)))
+    im = ax.imshow(sel_freq_active, aspect="auto", cmap="YlOrRd",
+                   vmin=0, vmax=sel_freq_active.max())
+    ax.set_xticks(range(max_budget))
+    ax.set_xticklabels([f"Step {i+1}" for i in range(max_budget)], rotation=45, ha="right")
+    ax.set_yticks(range(len(active_rows)))
+    ax.set_yticklabels([f"Feat {i}" for i in active_rows], fontsize=7)
+    ax.set_xlabel("Acquisition Step")
+    ax.set_ylabel("Feature Index")
+    ax.set_title("CUBE-NM: Feature Selection Frequency per Step (EC2 kNN)")
+    fig.colorbar(im, ax=ax, label="Selection Frequency")
+    plt.tight_layout()
+    heatmap_path = output_plot.replace(".png", "_feature_order.png")
+    fig.savefig(heatmap_path, dpi=150)
+    print(f"Feature order heatmap saved to {heatmap_path}")
+
+    # Also print top-5 most selected features per step
+    print(f"\n{'Step':<6} | Top-5 features selected")
+    print("=" * 45)
+    for s in range(max_budget):
+        top5 = np.argsort(selection_counts[:, s])[::-1][:5]
+        counts = selection_counts[top5, s]
+        items = ", ".join(f"feat{f}({c})" for f, c in zip(top5, counts))
+        print(f"{s+1:<6} | {items}")
 
 
 if __name__ == "__main__":

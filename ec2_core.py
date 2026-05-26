@@ -1,9 +1,11 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import TQDMProgressBar
+from sklearn.metrics import roc_auc_score
 from torch.distributions.normal import Normal
 from torch.utils.data import DataLoader
 
@@ -324,7 +326,8 @@ class PVAEPretrainer(pl.LightningModule):
 
 
 class PredictorPretrainer(pl.LightningModule):
-    def __init__(self, predictor, mask_layer, lr, factor=0.5, patience=10, min_lr=1e-6):
+    def __init__(self, predictor, mask_layer, lr, factor=0.5, patience=10, min_lr=1e-6,
+                 class_weights=None):
         super().__init__()
         self.predictor = predictor
         self.mask_layer = mask_layer
@@ -333,7 +336,7 @@ class PredictorPretrainer(pl.LightningModule):
         self.patience = patience
         self.min_lr = min_lr
         self.mask_size = mask_layer.mask_size
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -392,8 +395,10 @@ class EC2Estimator(pl.LightningModule):
                  feat_mean, feat_std,
                  lr, max_features, eps,
                  k=50,
+                 knn_subsample=None,
                  factor=0.5, patience=10, min_lr=1e-6, disable_early_stopping=False,
-                 random_first_step=False):
+                 random_first_step=False,
+                 val_monitor='accuracy'):
         super().__init__()
         self.value_network = value_network
         self.predictor = predictor
@@ -404,6 +409,7 @@ class EC2Estimator(pl.LightningModule):
         self.register_buffer('feat_mean', torch.tensor(feat_mean, dtype=torch.float32))
         self.register_buffer('feat_std',  torch.tensor(feat_std,  dtype=torch.float32))
         self.k = k
+        self.knn_subsample = knn_subsample
         self.lr = lr
         self.min_lr = min_lr
         self.patience = patience
@@ -424,6 +430,7 @@ class EC2Estimator(pl.LightningModule):
         self.eps_steps = 8
         self.early_stopping_epochs = patience + 1
         self.automatic_optimization = False
+        self.val_monitor = val_monitor
 
     def on_fit_start(self):
         self.num_epsilon_steps = 0
@@ -445,7 +452,19 @@ class EC2Estimator(pl.LightningModule):
                 left_counts_g, right_counts_g, left_total_g, right_total_g, N
             )
         self.register_buffer('global_ec2_cache', global_ec2)           # [d_in]
-        self.register_buffer('left_float_train', left_float_g.bool())  # [N, d_in, T] ~12 MB
+        self.register_buffer('left_float_train', left_float_g.bool())  # [N, d_in, T]
+
+        # Subsample X_train / y_train for kNN distance computation to bound
+        # the [B, N_knn, d_in] intermediate tensor when N is large.
+        if self.knn_subsample is not None and self.knn_subsample < N:
+            perm = torch.randperm(N, device=self.device)[:self.knn_subsample]
+            self.register_buffer('X_train_knn', self.X_train[perm])
+            self.register_buffer('y_train_knn', self.y_train[perm])
+            self.register_buffer('left_float_train_knn', left_float_g[perm].bool())
+        else:
+            self.register_buffer('X_train_knn', self.X_train)
+            self.register_buffer('y_train_knn', self.y_train)
+            self.register_buffer('left_float_train_knn', left_float_g.bool())
 
     def on_train_epoch_start(self):
         self._train_step_outputs = []
@@ -480,9 +499,9 @@ class EC2Estimator(pl.LightningModule):
                 actions = exploit * best + (1 - exploit) * random_action
 
             targets = knn_ec2_target(
-                x, mask, self.X_train, self.y_train, self.feat_thresholds, k=self.k,
+                x, mask, self.X_train_knn, self.y_train_knn, self.feat_thresholds, k=self.k,
                 global_ec2_cache=self.global_ec2_cache,
-                left_float_train=self.left_float_train,
+                left_float_train=self.left_float_train_knn,
             )  # [B, d_in]
 
             unobserved = (mask == 0).float()  # [B, d_in]
@@ -542,20 +561,40 @@ class EC2Estimator(pl.LightningModule):
         y_list = [out["y"] for out in outputs]
         y = torch.cat(y_list)
         preds_cat = [torch.cat(preds) for preds in zip(*pred_list)]
+
+        # Accuracy
         pred_acc_ = [multiclass_accuracy(preds, y) for preds in preds_cat]
-
-        pred_acc_mean = torch.stack(pred_acc_).mean()
+        pred_acc_mean  = torch.stack(pred_acc_).mean()
         pred_acc_final = pred_acc_[-1]
+        self.log("Acc Val/Predictor Mean",  pred_acc_mean,  prog_bar=True,  logger=True)
+        self.log("Acc Val/Predictor Final", pred_acc_final, prog_bar=False, logger=True)
 
-        self.log("Acc Val/Predictor Mean", pred_acc_mean, prog_bar=True, logger=True)
-        self.log("Acc Val/Predictor Final", pred_acc_final, prog_bar=True, logger=True)
+        # AUROC
+        y_np   = y.cpu().numpy()
+        d_out  = preds_cat[0].shape[1]
+        auroc_per_step = []
+        for preds in preds_cat:
+            probs = preds.cpu().numpy()
+            try:
+                if d_out == 2:
+                    auc = roc_auc_score(y_np, probs[:, 1])
+                else:
+                    auc = roc_auc_score(y_np, probs, multi_class='ovr', average='macro')
+            except ValueError:
+                auc = float('nan')
+            auroc_per_step.append(auc)
+        auroc_mean  = float(np.nanmean(auroc_per_step))
+        auroc_final = auroc_per_step[-1]
+        self.log("AUROC Val/Predictor Mean",  auroc_mean,  prog_bar=True,  logger=True)
+        self.log("AUROC Val/Predictor Final", auroc_final, prog_bar=False, logger=True)
+
+        primary_metric = torch.tensor(auroc_mean) if self.val_monitor == 'auroc' else pred_acc_mean
 
         sch = self.lr_schedulers()
         if sch is not None:
-            metric = pred_acc_mean
-            sch.step(metric)
+            sch.step(primary_metric)
 
-            if metric == sch.best:
+            if primary_metric >= sch.best:
                 self.num_bad_epochs = 0
             else:
                 self.num_bad_epochs += 1

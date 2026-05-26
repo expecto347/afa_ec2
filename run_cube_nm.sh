@@ -3,8 +3,8 @@
 #SBATCH -c 8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH -t 3:00:00
-#SBATCH -p long
+#SBATCH -t 30:00
+#SBATCH -p short
 #SBATCH -o logs/%j.out
 
 cd ~/AFA_EC2
