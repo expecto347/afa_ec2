@@ -398,7 +398,8 @@ class EC2Estimator(pl.LightningModule):
                  knn_subsample=None,
                  factor=0.5, patience=10, min_lr=1e-6, disable_early_stopping=False,
                  random_first_step=False,
-                 val_monitor='accuracy'):
+                 val_monitor='accuracy',
+                 feature_groups=None):
         super().__init__()
         self.value_network = value_network
         self.predictor = predictor
@@ -431,6 +432,31 @@ class EC2Estimator(pl.LightningModule):
         self.early_stopping_epochs = patience + 1
         self.automatic_optimization = False
         self.val_monitor = val_monitor
+
+        self.feature_groups = feature_groups
+        if feature_groups is not None:
+            self.n_groups = len(feature_groups)
+            gcm = torch.zeros(self.n_groups, self.mask_size, dtype=torch.bool)
+            for g, cols in enumerate(feature_groups):
+                for c in cols:
+                    gcm[g, c] = True
+            self.register_buffer('group_col_matrix', gcm)
+        else:
+            self.n_groups = self.mask_size
+
+    def _col_scores_to_group_scores(self, pred_ec2, mask):
+        """Aggregate per-column EC2 scores to per-group scores (min over group columns)."""
+        penalized = pred_ec2 + 1e6 * mask  # already-observed cols → +inf
+        gcm = self.group_col_matrix  # bool [n_groups, d_in]
+        scores = penalized.unsqueeze(1).expand(-1, self.n_groups, -1)  # [B, n_groups, d_in]
+        non_group = (~gcm).unsqueeze(0).float() * 1e6
+        group_scores = (scores + non_group).min(dim=2).values  # [B, n_groups]
+        return group_scores
+
+    def _apply_group_action(self, mask, group_actions):
+        """Set all columns belonging to selected groups to observed."""
+        selected_cols = self.group_col_matrix[group_actions].float()  # [B, d_in]
+        return torch.max(mask, selected_cols)
 
     def on_fit_start(self):
         self.num_epsilon_steps = 0
@@ -489,9 +515,14 @@ class EC2Estimator(pl.LightningModule):
             x_masked = self.mask_layer(x, mask)
             pred_ec2 = self.value_network(x_masked)  # [B, d_in]
 
-            penalized = pred_ec2 + 1e6 * mask
-            best = torch.argmin(penalized, dim=1)
-            random_action = torch.randint(self.mask_size, (len(x),), device=x.device)
+            if self.feature_groups is not None:
+                group_scores = self._col_scores_to_group_scores(pred_ec2, mask)
+                best = torch.argmin(group_scores, dim=1)
+                random_action = torch.randint(self.n_groups, (len(x),), device=x.device)
+            else:
+                penalized = pred_ec2 + 1e6 * mask
+                best = torch.argmin(penalized, dim=1)
+                random_action = torch.randint(self.mask_size, (len(x),), device=x.device)
             if self.random_first_step and step == 0:
                 actions = random_action
             else:
@@ -511,7 +542,10 @@ class EC2Estimator(pl.LightningModule):
             self.manual_backward(value_network_loss / self.max_features)
             value_network_loss_total += value_network_loss.detach()
 
-            mask = torch.max(mask, ind_to_onehot(actions, self.mask_size))
+            if self.feature_groups is not None:
+                mask = self._apply_group_action(mask, actions)
+            else:
+                mask = torch.max(mask, ind_to_onehot(actions, self.mask_size))
 
         opt.step()
         out = {
@@ -538,9 +572,14 @@ class EC2Estimator(pl.LightningModule):
             x_masked = self.mask_layer(x, mask)
             pred_ec2 = self.value_network(x_masked)
 
-            pred_ec2 += 1e6 * mask
-            best_feature_index = torch.argmin(pred_ec2, dim=1)
-            mask = torch.max(mask, ind_to_onehot(best_feature_index, self.mask_size))
+            if self.feature_groups is not None:
+                group_scores = self._col_scores_to_group_scores(pred_ec2, mask)
+                best_group_index = torch.argmin(group_scores, dim=1)
+                mask = self._apply_group_action(mask, best_group_index)
+            else:
+                pred_ec2 += 1e6 * mask
+                best_feature_index = torch.argmin(pred_ec2, dim=1)
+                mask = torch.max(mask, ind_to_onehot(best_feature_index, self.mask_size))
 
             x_masked = self.mask_layer(x, mask)
             pred_list.append(self.estimate_class_frequency_mc(x, mask, x_masked))

@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import torch
 import numpy as np
@@ -24,7 +25,7 @@ from ec2_tabular import TabularDataset, _parse_label_col
 from ec2_core import Predictor, EC2Estimator, MaskLayer
 
 
-def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout):
+def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout, feature_groups=None):
     device = torch.device(f'cuda:{gpu}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -41,8 +42,9 @@ def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout):
 
     d_in  = X_train.shape[1]
     d_out = int(y_train.max().item()) + 1
-    max_features = d_in
-    print(f"Inferred from checkpoint: d_in={d_in}, d_out={d_out}")
+    n_groups = len(feature_groups) if feature_groups is not None else None
+    max_features = n_groups if feature_groups is not None else d_in
+    print(f"Inferred from checkpoint: d_in={d_in}, d_out={d_out}, max_features={max_features}")
 
     print("Loading test dataset...")
     test_dataset = TabularDataset(test_csv, label_col=label_col, mean=feat_mean, std=feat_std)
@@ -75,6 +77,7 @@ def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout):
         lr=1e-3,
         max_features=max_features,
         eps=0.1,
+        feature_groups=feature_groups,
         strict=False,
     ).to(device)
 
@@ -105,22 +108,36 @@ def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout):
                 # EC2 greedy selection
                 x_masked_ec2 = model.mask_layer(x, mask_ec2)
                 pred_ec2 = model.value_network(x_masked_ec2)
-                pred_ec2 += 1e6 * mask_ec2
-                best_idx = torch.argmin(pred_ec2, dim=1)
-                mask_update = torch.zeros_like(mask_ec2)
-                mask_update.scatter_(1, best_idx.unsqueeze(1), 1.0)
-                mask_ec2 = torch.max(mask_ec2, mask_update)
+                if feature_groups is not None:
+                    group_scores = model._col_scores_to_group_scores(pred_ec2, mask_ec2)
+                    best_group_idx = torch.argmin(group_scores, dim=1)
+                    mask_ec2 = model._apply_group_action(mask_ec2, best_group_idx)
+                else:
+                    pred_ec2 += 1e6 * mask_ec2
+                    best_idx = torch.argmin(pred_ec2, dim=1)
+                    mask_update = torch.zeros_like(mask_ec2)
+                    mask_update.scatter_(1, best_idx.unsqueeze(1), 1.0)
+                    mask_ec2 = torch.max(mask_ec2, mask_update)
                 x_masked_ec2 = model.mask_layer(x, mask_ec2)
                 all_preds[feature_step].append(
                     model.estimate_class_frequency_mc(x, mask_ec2, x_masked_ec2).cpu()
                 )
 
                 # Random selection
-                rand_scores = torch.rand(len(x), d_in, device=device) - 1e6 * mask_rand
-                best_idx_rand = torch.argmax(rand_scores, dim=1)
-                mask_update_rand = torch.zeros_like(mask_rand)
-                mask_update_rand.scatter_(1, best_idx_rand.unsqueeze(1), 1.0)
-                mask_rand = torch.max(mask_rand, mask_update_rand)
+                if feature_groups is not None:
+                    gcm = model.group_col_matrix.float()  # [n_groups, d_in]
+                    group_sizes = gcm.sum(dim=1)  # [n_groups]
+                    mask_sum = torch.matmul(mask_rand, gcm.t())  # [B, n_groups]
+                    group_acquired = mask_sum >= group_sizes.unsqueeze(0)
+                    rand_group_scores = torch.rand(len(x), n_groups, device=device) - 1e6 * group_acquired.float()
+                    best_rand_group = torch.argmax(rand_group_scores, dim=1)
+                    mask_rand = model._apply_group_action(mask_rand, best_rand_group)
+                else:
+                    rand_scores = torch.rand(len(x), d_in, device=device) - 1e6 * mask_rand
+                    best_idx_rand = torch.argmax(rand_scores, dim=1)
+                    mask_update_rand = torch.zeros_like(mask_rand)
+                    mask_update_rand.scatter_(1, best_idx_rand.unsqueeze(1), 1.0)
+                    mask_rand = torch.max(mask_rand, mask_update_rand)
                 x_masked_rand = model.mask_layer(x, mask_rand)
                 all_preds_random[feature_step].append(
                     model.estimate_class_frequency_mc(x, mask_rand, x_masked_rand).cpu()
@@ -180,4 +197,12 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    evaluate_ec2(args.checkpoint, args.test_csv, args.label_col, args.gpu, args.hidden, args.dropout)
+    feature_groups = None
+    groups_path = os.path.join(os.path.dirname(os.path.abspath(args.test_csv)), "feature_groups.json")
+    if os.path.exists(groups_path):
+        with open(groups_path) as f:
+            feature_groups = json.load(f)
+        print(f"Loaded feature_groups.json: {len(feature_groups)} groups")
+
+    evaluate_ec2(args.checkpoint, args.test_csv, args.label_col, args.gpu, args.hidden, args.dropout,
+                 feature_groups=feature_groups)

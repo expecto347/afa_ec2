@@ -13,7 +13,7 @@
 
 cd ~/AFA_EC2
 
-# apptainer exec --nv afa_env.sif python -u prepare_bank_marketing.py
+apptainer exec --nv afa_env.sif python -u prepare_bank_marketing.py
 
 apptainer exec --nv afa_env.sif python -u ec2_tabular.py \
     --train_csv /data/users/haozhes/bank_marketing/train.csv \

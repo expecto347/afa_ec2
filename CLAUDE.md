@@ -135,3 +135,43 @@ Logs and checkpoints land in `logs/` (gitignored). TensorBoard logs are stored t
 - `train_predictor.py`: Standalone MNIST predictor pretraining script (historical).
 - `check_cube_balance.py`: Quick dataset inspection utility for `AFAContextDataset`.
 - `visualization.py` / `scripts/figure.py`: Plotting utilities for evaluation outputs.
+
+## Bank Marketing 数据集的特殊处理
+
+Bank Marketing 含有大量类别特征（10 个），通过 `prepare_bank_marketing.py` one-hot 展开后共约 63 列。这导致三个问题需要特殊处理，均已在 `ec2_tabular.py` 中实现，对其他数据集**无影响**。
+
+### 问题与修复
+
+**Fix 1 — 不使用类别权重**
+
+Bank Marketing 类别极度不平衡（"yes" 约 11%）。若在 `PredictorPretrainer` 中使用逆频率 `class_weights`，预测器在低 budget 时会过度预测少数类，导致准确率崩溃（88% → 74%），而 AUROC 因为是排名指标反而上升，两者严重分裂。`ec2_tabular.py` 已移除 `class_weights`，用均等损失训练预测器。
+
+**Fix 2 — 仅对连续列做 StandardScaler**
+
+稀有 one-hot 列（如某职业只占 5%）经 StandardScaler 后值可达 +4.36，在 kNN 欧氏距离中远远压制真正的连续特征，扭曲 kNN EC2 目标值。`ec2_tabular.py` 自动检测二值列（`np.isin(col, [0,1])`），只对连续列做标准化，one-hot 列保持原始 0/1。
+
+**Fix 3 — 特征组级别的 acquisition**
+
+若每个 dummy 列算作一个独立 acquisition 步骤，budget=1 只能看到"job_admin."而不是完整的"job"特征，语义错误且效率低。修复方案：
+
+- `prepare_bank_marketing.py` 构建 `feature_groups.json`：10 个连续特征各为单列 group，10 个类别特征各为包含所有 dummy 列的 group，共 20 个 group；保存在数据目录下
+- `ec2_tabular.py` 和 `evaluate_ec2_tabular.py` 自动从 train/test CSV 同目录加载 `feature_groups.json`，传入 `EC2Estimator`
+- `EC2Estimator`（`ec2_core.py`）：注册 `group_col_matrix` 缓冲区 `[n_groups, d_in]`；`_col_scores_to_group_scores()` 将列级 EC2 分数聚合为 group 分数；`_apply_group_action()` 一次将整个 group 的所有列置为已观测；training/validation step 有 if/else 分支，无 groups 时代码路径与原来完全一致
+
+### 运行方式
+
+```bash
+# 一键训练 + 评估（prepare_bank_marketing.py 在脚本内自动运行）
+sbatch run_bank_marketing.sh
+```
+
+数据目录：`/data/users/haozhes/bank_marketing/`（含 train/val/test.csv 和 feature_groups.json）。
+
+### 各数据集特征类型对比
+
+| 数据集 | 连续特征 | 类别/二值特征 | 是否需要 Fix 1/2/3 |
+|--------|---------|-------------|------------------|
+| Grid Stability | 全部 12 列 | 无 | 否 |
+| Metabric | 全部（z-score 基因表达） | 无（突变列未被选中） | 否 |
+| CUBE-NM | 全部 55 列 | 无 | 否 |
+| Bank Marketing | 10 列 | 53 个 one-hot dummy 列 | **是** |

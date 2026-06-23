@@ -12,6 +12,7 @@ d_in and d_out are inferred automatically from the data.
 """
 
 import argparse
+import json
 import os
 import pandas as pd
 import numpy as np
@@ -121,10 +122,17 @@ def main():
         col_idx = args.label_col if args.label_col >= 0 else raw_train_df.shape[1] + args.label_col
         X_raw = raw_train_df.drop(raw_train_df.columns[col_idx], axis=1).values.astype(np.float32)
 
-    scaler = StandardScaler()
-    scaler.fit(X_raw)
-    feat_mean = scaler.mean_.astype(np.float32)
-    feat_std  = scaler.scale_.astype(np.float32)
+    # Fix 2: only standardize continuous columns; leave binary one-hot columns as 0/1
+    is_binary = np.array([np.all(np.isin(X_raw[:, j], [0.0, 1.0])) for j in range(d_in)])
+    cont_cols = np.where(~is_binary)[0]
+    feat_mean = np.zeros(d_in, dtype=np.float32)
+    feat_std  = np.ones(d_in, dtype=np.float32)
+    if len(cont_cols) > 0:
+        scaler = StandardScaler()
+        scaler.fit(X_raw[:, cont_cols])
+        feat_mean[cont_cols] = scaler.mean_.astype(np.float32)
+        feat_std[cont_cols]  = scaler.scale_.astype(np.float32)
+    print(f"Continuous columns: {len(cont_cols)}, binary columns: {is_binary.sum()}")
     X_train_tensor = torch.tensor((X_raw - feat_mean) / (feat_std + 1e-8))
 
     if isinstance(args.label_col, str):
@@ -135,9 +143,17 @@ def main():
     y_train_tensor = torch.tensor(y_raw)
     feat_thresholds = compute_feature_thresholds(X_train_tensor)
 
-    counts = np.bincount(y_raw)
-    class_weights = torch.tensor(len(y_raw) / (len(counts) * counts), dtype=torch.float32)
-    print(f"Class weights: {class_weights.tolist()}")
+    # Fix 3: load feature groups (produced by prepare_bank_marketing.py)
+    groups_path = os.path.join(os.path.dirname(os.path.abspath(args.train_csv)), "feature_groups.json")
+    feature_groups = None
+    if os.path.exists(groups_path):
+        with open(groups_path) as f:
+            feature_groups = json.load(f)
+        n_groups = len(feature_groups)
+        print(f"Loaded feature_groups.json: {n_groups} groups from {d_in} columns")
+        max_features = min(args.max_features, n_groups) if args.max_features is not None else n_groups
+    else:
+        max_features = args.max_features if args.max_features is not None else d_in
 
     train_data = TabularDataset(args.train_csv, args.label_col, mean=feat_mean, std=feat_std)
     val_data   = TabularDataset(args.val_csv,   args.label_col, mean=feat_mean, std=feat_std)
@@ -169,7 +185,7 @@ def main():
     )
 
     print("Pretraining Predictor...")
-    pred_pretrainer = PredictorPretrainer(predictor, mask_layer, lr=1e-3, class_weights=class_weights)
+    pred_pretrainer = PredictorPretrainer(predictor, mask_layer, lr=1e-3)
     pred_logger = TensorBoardLogger(args.log_dir, name=args.run_name, version="pretrain_predictor")
     pred_callbacks = [TQDMProgressBar(refresh_rate=50)]
     if not args.disable_early_stopping:
@@ -200,6 +216,7 @@ def main():
         patience=args.patience,
         disable_early_stopping=args.disable_early_stopping,
         val_monitor='auroc',
+        feature_groups=feature_groups,
     )
 
     logger = TensorBoardLogger(args.log_dir, name=args.run_name, version="ec2_train")

@@ -17,6 +17,7 @@ Run once before launching run_bank_marketing.sh:
 """
 
 import argparse
+import json
 import os
 import numpy as np
 import pandas as pd
@@ -62,9 +63,37 @@ def main():
     bool_cols = df.select_dtypes(include="bool").columns
     df[bool_cols] = df[bool_cols].astype(int)
 
-    d_in = df.shape[1] - 1
+    # Build feature_groups: map each original feature → list of column indices
+    feature_cols = [c for c in df.columns if c != "label"]
+    d_in = len(feature_cols)
+    col_to_idx = {c: i for i, c in enumerate(feature_cols)}
+
+    feature_groups = []
+    used = set()
+    # Continuous features come before dummies; add them as singleton groups first
+    for col in feature_cols:
+        if col in used:
+            continue
+        # Check if this column is a dummy for a categorical (name contains "_")
+        matched = False
+        for cat in CATEGORICAL_COLS:
+            if col.startswith(cat + "_"):
+                matched = True
+                break
+        if not matched:
+            feature_groups.append([col_to_idx[col]])
+            used.add(col)
+
+    # Now add one group per categorical (all its dummies together)
+    for cat in CATEGORICAL_COLS:
+        dummy_cols = [c for c in feature_cols if c.startswith(cat + "_")]
+        if dummy_cols:
+            feature_groups.append([col_to_idx[c] for c in dummy_cols])
+            used.update(dummy_cols)
+
     pos  = df["label"].sum()
     print(f"Features after encoding: d_in={d_in}")
+    print(f"Feature groups: {len(feature_groups)} acquisition units")
     print(f"Class distribution: 1 (yes)={pos} ({100*pos/len(df):.1f}%), "
           f"0 (no)={len(df)-pos} ({100*(len(df)-pos)/len(df):.1f}%)")
 
@@ -77,7 +106,11 @@ def main():
     train.to_csv(os.path.join(args.output_dir, "train.csv"), index=False)
     val.to_csv(  os.path.join(args.output_dir, "val.csv"),   index=False)
     test.to_csv( os.path.join(args.output_dir, "test.csv"),  index=False)
-    print(f"Saved CSVs to {args.output_dir}/")
+
+    groups_path = os.path.join(args.output_dir, "feature_groups.json")
+    with open(groups_path, "w") as f:
+        json.dump(feature_groups, f)
+    print(f"Saved CSVs and feature_groups.json to {args.output_dir}/")
 
 
 if __name__ == "__main__":
