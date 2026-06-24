@@ -7,6 +7,7 @@ seed = train_seed + 100 (separate from training data).
 """
 
 import argparse
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ import matplotlib.pyplot as plt
 from afabench.common.datasets.datasets import AFAContextDataset
 from ec2_core import Predictor, EC2Estimator, MaskLayer
 from ec2_cube_nm import CubeNMDataset, CUBE_NM_KWARGS
+from eval_utils import run_dir_from_checkpoint, save_eval_results, auc_under_curve, append_to_results_log
 
 BENCHMARK_BUDGETS = [0, 3, 5, 7, 10, 14]
 D_IN    = 55
@@ -128,6 +130,7 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
     print(f"\n{'Budget':<10} | {'EC2 Acc':<12} | {'Random Acc':<12}")
     print("=" * 40)
     ec2_accs, rand_accs = [], []
+    results = []
     for budget in range(max_budget + 1):
         p_ec2  = torch.argmax(torch.cat(all_preds_ec2[budget]),  dim=1).numpy()
         p_rand = torch.argmax(torch.cat(all_preds_rand[budget]), dim=1).numpy()
@@ -135,6 +138,7 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
         acc_rand = accuracy_score(y_true, p_rand)
         ec2_accs.append(acc_ec2)
         rand_accs.append(acc_rand)
+        results.append((budget, acc_ec2, acc_rand))
         print(f"{budget:<10} | {acc_ec2:<12.4f} | {acc_rand:<12.4f}")
 
     # Accuracy plot
@@ -176,6 +180,22 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
     heatmap_path = output_plot.replace(".png", "_feature_order.png")
     fig.savefig(heatmap_path, dpi=150)
     print(f"Feature order heatmap saved to {heatmap_path}")
+
+    # ── Persist results ──────────────────────────────────────────────────────
+    run_dir  = run_dir_from_checkpoint(checkpoint_path)
+    run_name = os.path.basename(run_dir)
+
+    save_eval_results(run_dir, results, ["budget", "ec2_acc", "rand_acc"])
+
+    budgets = [r[0] for r in results]
+    summary = {
+        "auc_acc_curve":   auc_under_curve(budgets, ec2_accs),
+        "final_acc":       ec2_accs[-1],
+        "rand_final_acc":  rand_accs[-1],
+        "max_budget":      max_budget,
+        "benchmark_budgets": str(BENCHMARK_BUDGETS),
+    }
+    append_to_results_log(run_name, "cube_nm", summary)
 
     # Also print top-5 most selected features per step
     print(f"\n{'Step':<6} | Top-5 features selected")

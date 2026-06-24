@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from ec2_core import EC2Estimator, MaskLayer, Predictor
 from ec2_sefa import SEFA_DEFAULT_DATA_DIR, prepare_data
+from eval_utils import run_dir_from_checkpoint, save_eval_results, auc_under_curve, append_to_results_log
 
 
 # Relevant feature indices (0-based) per dataset and branch.
@@ -182,6 +183,7 @@ def evaluate_ec2(args):
     print(f"{'Features':<12} | {'EC2 Acc':<12} | {'EC2 AUROC':<12} | {'Rand Acc':<12} | {'Rand AUROC':<12}")
     print("=" * 85)
 
+    curve_results = []
     for step in range(max_features + 1):
         preds  = torch.cat(all_preds[step])
         p_rand = torch.cat(all_preds_random[step])
@@ -200,6 +202,7 @@ def evaluate_ec2(args):
         except ValueError:
             auc_r = float("nan")
 
+        curve_results.append((step, acc, auc, acc_r, auc_r))
         print(f"{step:<12} | {acc:<12.4f} | {auc:<12.4f} | {acc_r:<12.4f} | {auc_r:<12.4f}")
 
     print("=" * 85)
@@ -253,6 +256,29 @@ def evaluate_ec2(args):
         print(f"{'overall':<12} | {mean_ec2_all:<18.2f} | {'':16} | "
               f"{mean_rand_all:<18.2f} |")
         print("-" * 90)
+
+    # ── Persist results ──────────────────────────────────────────────────────
+    run_dir  = run_dir_from_checkpoint(args.checkpoint)
+    run_name = os.path.basename(run_dir)
+
+    save_eval_results(
+        run_dir, curve_results,
+        ["budget", "ec2_acc", "ec2_auroc", "rand_acc", "rand_auroc"],
+    )
+
+    budgets    = [r[0] for r in curve_results]
+    ec2_accs   = [r[1] for r in curve_results]
+    ec2_aurocs = [r[2] for r in curve_results]
+    summary = {
+        "auc_acc_curve":    auc_under_curve(budgets, ec2_accs),
+        "auc_auroc_curve":  auc_under_curve(budgets, ec2_aurocs),
+        "final_acc":        curve_results[-1][1],
+        "final_auroc":      curve_results[-1][2],
+        "rand_final_acc":   curve_results[-1][3],
+        "rand_final_auroc": curve_results[-1][4],
+        "max_budget":       max_features,
+    }
+    append_to_results_log(run_name, args.dataset, summary)
 
 
 if __name__ == "__main__":

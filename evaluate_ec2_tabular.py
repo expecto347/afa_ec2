@@ -23,6 +23,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 
 from ec2_tabular import TabularDataset, _parse_label_col
 from ec2_core import Predictor, EC2Estimator, MaskLayer
+from eval_utils import run_dir_from_checkpoint, save_eval_results, auc_under_curve, append_to_results_log
 
 
 def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout, feature_groups=None):
@@ -182,6 +183,30 @@ def evaluate_ec2(checkpoint_path, test_csv, label_col, gpu, hidden, dropout, fea
         print(f"{step:<15} | {acc:<15.4f} | {auc_score:<15.4f} | {acc_rand:<15.4f} | {auc_score_rand:<15.4f}")
 
     print("="*80)
+
+    # ── Persist results ──────────────────────────────────────────────────────
+    run_dir  = run_dir_from_checkpoint(checkpoint_path)
+    run_name = os.path.basename(run_dir)
+    dataset  = os.path.basename(os.path.dirname(test_csv))  # e.g. "ckd", "bank_marketing"
+
+    columns = ["budget", "ec2_acc", "ec2_auroc", "rand_acc", "rand_auroc"]
+    save_eval_results(run_dir, results, columns)
+
+    budgets    = [r[0] for r in results]
+    ec2_accs   = [r[1] for r in results]
+    ec2_aurocs = [r[2] for r in results]
+    summary = {
+        "auc_acc_curve":    auc_under_curve(budgets, ec2_accs),
+        "auc_auroc_curve":  auc_under_curve(budgets, ec2_aurocs),
+        "final_acc":        results[-1][1],
+        "final_auroc":      results[-1][2],
+        "rand_final_acc":   results[-1][3],
+        "rand_final_auroc": results[-1][4],
+        "max_budget":       results[-1][0],
+        "n_feature_groups": max_features,
+    }
+    append_to_results_log(run_name, dataset, summary)
+
     return results
 
 

@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--disable_early_stopping", action="store_true", help="Disable early stopping")
     parser.add_argument("--k", type=int, default=50, help="Number of kNN neighbors")
     parser.add_argument("--patience", type=int, default=20, help="LR scheduler patience and early-stopping patience")
+    parser.add_argument("--run_name", type=str, default="ec2_grid_stability_trial_0")
     return parser.parse_args()
 
 
@@ -92,7 +93,7 @@ def main():
         nn.Linear(hidden, d_in),
     )
 
-    run_description = f"ec2_grid_stability_trial_0"
+    run_description = args.run_name
 
     print("Pretraining Predictor...")
     pred_pretrainer = PredictorPretrainer(predictor, mask_layer, lr=1e-3)
