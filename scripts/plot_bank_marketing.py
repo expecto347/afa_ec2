@@ -36,31 +36,23 @@ gdfs_acc   = [88.74, 88.74, 91.03, 91.49, 91.65, 91.62, 91.71, 91.70, 91.73, 91.
 aaco_auroc = [50.00, 54.93, 59.21, 77.82, 87.24, 89.24, 90.53, 91.28, 91.76, 92.21, 92.69]
 aaco_acc   = [88.74, 88.53, 89.06, 89.27, 89.48, 90.11, 90.40, 90.76, 91.03, 91.15, 91.16]
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig, ax = plt.subplots(1, 1, figsize=(7, 5))
 
-for ax, metric, title in zip(axes, ["AUROC", "Accuracy"], ["AUROC (%)", "Accuracy (%)"]):
-    ec2_y  = ec2_auroc  if metric == "AUROC" else ec2_acc
-    cae_y  = cae_auroc  if metric == "AUROC" else cae_acc
-    eddi_y = eddi_auroc if metric == "AUROC" else eddi_acc
-    ga_y   = ga_auroc   if metric == "AUROC" else ga_acc
-    iter_y = iter_auroc if metric == "AUROC" else iter_acc
-    gdfs_y = gdfs_auroc if metric == "AUROC" else gdfs_acc
-    aaco_y = aaco_auroc if metric == "AUROC" else aaco_acc
+ax.plot(features, ec2_acc,  marker="o", linewidth=2,   label="EC2 (ours)", color="tab:blue")
+ax.plot(features, cae_acc,  marker="s", linewidth=1.5, label="CAE",        color="tab:orange",  linestyle="--")
+ax.plot(features, eddi_acc, marker="^", linewidth=1.5, label="EDDI",       color="tab:green",   linestyle="--")
+ax.plot(features, ga_acc,   marker="D", linewidth=1.5, label="Greedy-Abl", color="tab:red",     linestyle="--")
+ax.plot(features, iter_acc, marker="v", linewidth=1.5, label="Iterative",  color="tab:purple",  linestyle="--")
+ax.plot(features, gdfs_acc, marker="x", linewidth=1.5, label="GDFS",       color="tab:brown",   linestyle="-.")
+ax.plot(features, aaco_acc, marker="h", linewidth=1.5, label="AACO",       color="tab:olive",   linestyle="-.")
 
-    ax.plot(features, ec2_y,  marker="o", linewidth=2,   label="EC2 (ours)", color="tab:blue")
-    ax.plot(features, cae_y,  marker="s", linewidth=1.5, label="CAE",        color="tab:orange",  linestyle="--")
-    ax.plot(features, eddi_y, marker="^", linewidth=1.5, label="EDDI",       color="tab:green",   linestyle="--")
-    ax.plot(features, ga_y,   marker="D", linewidth=1.5, label="Greedy-Abl", color="tab:red",     linestyle="--")
-    ax.plot(features, iter_y, marker="v", linewidth=1.5, label="Iterative",  color="tab:purple",  linestyle="--")
-    ax.plot(features, gdfs_y, marker="x", linewidth=1.5, label="GDFS",       color="tab:brown",   linestyle="-.")
-    ax.plot(features, aaco_y, marker="h", linewidth=1.5, label="AACO",       color="tab:olive",   linestyle="-.")
-
-    ax.set_xlabel("Budget (# features acquired)")
-    ax.set_ylabel(title)
-    ax.set_title(f"Bank Marketing — {title}")
-    ax.set_xticks(features)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+ax.set_xlabel("Budget (# features acquired)")
+ax.set_ylabel("Accuracy (%)")
+ax.set_title("Bank Marketing — Accuracy (%)")
+ax.set_xticks(features)
+ax.set_ylim(88, 92)
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
 
 fig.tight_layout()
 out_path = "scripts/bank_marketing_comparison.png"

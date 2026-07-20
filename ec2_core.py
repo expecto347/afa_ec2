@@ -58,45 +58,47 @@ def multiclass_accuracy(pred_probs_or_logits, y):
     return (pred_labels == y).float().mean()
 
 
-def compute_feature_thresholds(X_train, n_thresholds=19):
-    """Compute percentile-based candidate split thresholds. Returns [d_in, T]."""
-    q = torch.linspace(0.05, 0.95, n_thresholds, device=X_train.device)
-    thresholds = torch.quantile(X_train, q, dim=0)  # [T, d_in]
-    return thresholds.T.contiguous()                 # [d_in, T]
+def compute_feature_thresholds(X_train, n_bins=10):
+    """Compute percentile-based candidate split thresholds. Returns [d_in, n_bins - 1]."""
+    q = torch.linspace(1.0 / n_bins, 1.0 - 1.0 / n_bins, n_bins - 1, device=X_train.device)
+    thresholds = torch.quantile(X_train, q, dim=0)   # [n_bins - 1, d_in]
+    return thresholds.T.contiguous()                 # [d_in, n_bins - 1]
 
 
-def _ec2_scores_from_counts(left_counts, right_counts, left_total, right_total, N):
-    """Shared Gini + EC2 computation. All inputs [C, d_in, T] or [d_in, T]."""
-    p_left_cls  = left_counts  / (left_total[None, :, :]  + 1e-8)  # [C, d_in, T]
-    p_right_cls = right_counts / (right_total[None, :, :] + 1e-8)
-    gini_left  = 1.0 - p_left_cls.pow(2).sum(0)   # [d_in, T]
-    gini_right = 1.0 - p_right_cls.pow(2).sum(0)
-    p_left  = left_total  / N                       # [d_in, T]
-    p_right = right_total / N
-    scores = p_left.pow(3) * gini_left + p_right.pow(3) * gini_right
-    return scores.max(dim=-1).values                # [d_in]
+def _ec2_scores_from_bin_counts(bin_counts, bin_totals, N):
+    """Shared Gini + EC2 computation across multiple bins.
+    bin_counts: [C, d_in, n_bins]
+    bin_totals: [d_in, n_bins]
+    Returns: [d_in]
+    """
+    p_bin_cls = bin_counts / (bin_totals[None, :, :] + 1e-8)  # [C, d_in, n_bins]
+    gini_bin = 1.0 - p_bin_cls.pow(2).sum(0)                  # [d_in, n_bins]
+    p_bin = bin_totals / N                                    # [d_in, n_bins]
+    scores = (p_bin.pow(3) * gini_bin).sum(dim=-1)            # [d_in]
+    return scores
 
 
 def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
-                   global_ec2_cache=None, left_float_train=None):
+                   global_ec2_cache=None, bin_oh_train=None):
     """
-    EC2 targets for all features via kNN + threshold binarization.
+    EC2 targets for all features via kNN + multiple bin discretization.
 
-    For each feature i, finds the threshold tau* that maximizes:
-      Score(tau) = p_left^3 * Gini_left + p_right^3 * Gini_right
+    For each feature i, calculates purity reduction across its bins:
+      Score = sum_b p_b^3 * Gini_b
 
     When mask is all-zero (step=0), uses the entire training set instead of k
     neighbors so that the target is the exact global statistic (zero variance).
 
     global_ec2_cache: precomputed [d_in] global EC2 scores (constant, avoids O(N) recomputation).
-    left_float_train: precomputed [N, d_in, T] bool threshold comparisons for X_train
-                      (avoids per-call recomputation in the kNN path).
+    bin_oh_train: precomputed [N, d_in, n_bins] one-hot bin assignments for X_train
+                  (avoids per-call recomputation in the kNN path).
 
-    Returns: [B, d_in]  best-threshold EC2 score per feature
+    Returns: [B, d_in] EC2 score per feature
     """
     B, d_in = x.shape[0], x.shape[1]
     num_classes = int(y_train.max().item()) + 1
     N = X_train.shape[0]
+    n_bins = feat_thresholds.shape[1] + 1
     device = x.device
 
     with torch.no_grad():
@@ -110,18 +112,17 @@ def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
             if global_ec2_cache is not None:
                 global_ec2 = global_ec2_cache
             else:
-                # [N, d_in, T]
-                left_float_g = (X_train[:, :, None] <= feat_thresholds[None, :, :]).float()
+                bin_indices_g = (X_train[:, :, None] > feat_thresholds[None, :, :]).sum(dim=-1)
+                bin_oh_g = torch.zeros(N, d_in, n_bins, device=device)
+                bin_oh_g.scatter_(-1, bin_indices_g.unsqueeze(-1), 1.0)
+
                 labels_oh_g  = torch.zeros(N, num_classes, device=device)
                 labels_oh_g.scatter_(1, y_train.unsqueeze(1).long(), 1.0)
-                # [C, d_in, T]
-                left_counts_g  = torch.einsum('nc,nit->cit', labels_oh_g, left_float_g)
-                right_counts_g = labels_oh_g.sum(0)[:, None, None] - left_counts_g
-                left_total_g   = left_float_g.sum(0)   # [d_in, T]
-                right_total_g  = N - left_total_g
-                global_ec2 = _ec2_scores_from_counts(
-                    left_counts_g, right_counts_g, left_total_g, right_total_g, N
-                )  # [d_in]
+                
+                bin_counts_g = torch.einsum('nc,ndp->cdp', labels_oh_g, bin_oh_g)
+                bin_totals_g = bin_oh_g.sum(dim=0)   # [d_in, n_bins]
+                global_ec2 = _ec2_scores_from_bin_counts(bin_counts_g, bin_totals_g, N)
+                
             ec2_scores[zero_mask_rows] = global_ec2.unsqueeze(0).expand(
                 zero_mask_rows.sum(), -1
             )
@@ -139,30 +140,26 @@ def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
             neighbor_labels   = y_train[indices]    # [B_nz, k]
             neighbor_features = X_train[indices]    # [B_nz, k, d_in]
 
-            if left_float_train is not None:
-                left_float = left_float_train[indices].float()  # [B_nz, k, d_in, T]
+            if bin_oh_train is not None:
+                bin_oh = bin_oh_train[indices].float()  # [B_nz, k, d_in, n_bins]
             else:
-                left_float = (
-                    neighbor_features[:, :, :, None] <= feat_thresholds[None, None, :, :]
-                ).float()  # [B_nz, k, d_in, T]
+                neighbor_bin_indices = (
+                    neighbor_features[:, :, :, None] > feat_thresholds[None, None, :, :]
+                ).sum(dim=-1)  # [B_nz, k, d_in]
+                bin_oh = torch.zeros(B_nz, k, d_in, n_bins, device=device)
+                bin_oh.scatter_(-1, neighbor_bin_indices.unsqueeze(-1), 1.0)
 
             labels_oh = torch.zeros(B_nz, k, num_classes, device=device)
             labels_oh.scatter_(2, neighbor_labels.unsqueeze(-1).long(), 1.0)
 
-            left_counts  = (labels_oh[:, :, :, None, None] * left_float[:, :, None, :, :]).sum(1)
-            right_counts = (labels_oh[:, :, :, None, None] * (1.0 - left_float[:, :, None, :, :])).sum(1)
-            left_total   = left_float.sum(1)   # [B_nz, d_in, T]
-            right_total  = k - left_total
+            bin_counts  = torch.einsum('bkc,bkdp->bcdp', labels_oh, bin_oh)
+            bin_totals  = bin_oh.sum(dim=1)   # [B_nz, d_in, n_bins]
 
-            # [B_nz, C, d_in, T]
-            p_left_cls  = left_counts  / (left_total[:, None, :, :]  + 1e-8)
-            p_right_cls = right_counts / (right_total[:, None, :, :] + 1e-8)
-            gini_left  = 1.0 - p_left_cls.pow(2).sum(1)   # [B_nz, d_in, T]
-            gini_right = 1.0 - p_right_cls.pow(2).sum(1)
-            p_left  = left_total  / k
-            p_right = right_total / k
-            scores  = p_left.pow(3) * gini_left + p_right.pow(3) * gini_right
-            ec2_scores[nonzero_mask_rows] = scores.max(dim=-1).values
+            p_bin_cls  = bin_counts  / (bin_totals.unsqueeze(1) + 1e-8)
+            gini_bin  = 1.0 - p_bin_cls.pow(2).sum(dim=1)   # [B_nz, d_in, n_bins]
+            p_bin  = bin_totals  / k
+            scores  = (p_bin.pow(3) * gini_bin).sum(dim=-1)
+            ec2_scores[nonzero_mask_rows] = scores
 
     return ec2_scores
 
@@ -466,19 +463,19 @@ class EC2Estimator(pl.LightningModule):
         # Precompute constants for knn_ec2_target (X_train / y_train / feat_thresholds are fixed).
         num_classes = int(self.y_train.max().item()) + 1
         N = self.X_train.shape[0]
+        n_bins = self.feat_thresholds.shape[1] + 1
         with torch.no_grad():
-            left_float_g = (self.X_train[:, :, None] <= self.feat_thresholds[None, :, :]).float()
+            bin_indices_g = (self.X_train[:, :, None] > self.feat_thresholds[None, :, :]).sum(dim=-1)
+            bin_oh_g = torch.zeros(N, self.X_train.shape[1], n_bins, device=self.device)
+            bin_oh_g.scatter_(-1, bin_indices_g.unsqueeze(-1), 1.0)
+            
             labels_oh_g = torch.zeros(N, num_classes, device=self.device)
             labels_oh_g.scatter_(1, self.y_train.unsqueeze(1).long(), 1.0)
-            left_counts_g  = torch.einsum('nc,nit->cit', labels_oh_g, left_float_g)
-            right_counts_g = labels_oh_g.sum(0)[:, None, None] - left_counts_g
-            left_total_g   = left_float_g.sum(0)
-            right_total_g  = N - left_total_g
-            global_ec2 = _ec2_scores_from_counts(
-                left_counts_g, right_counts_g, left_total_g, right_total_g, N
-            )
+            bin_counts_g  = torch.einsum('nc,ndp->cdp', labels_oh_g, bin_oh_g)
+            bin_totals_g  = bin_oh_g.sum(dim=0)
+            global_ec2 = _ec2_scores_from_bin_counts(bin_counts_g, bin_totals_g, N)
         self.register_buffer('global_ec2_cache', global_ec2)           # [d_in]
-        self.register_buffer('left_float_train', left_float_g.bool())  # [N, d_in, T]
+        self.register_buffer('bin_oh_train', bin_oh_g.bool())          # [N, d_in, n_bins]
 
         # Subsample X_train / y_train for kNN distance computation to bound
         # the [B, N_knn, d_in] intermediate tensor when N is large.
@@ -486,11 +483,11 @@ class EC2Estimator(pl.LightningModule):
             perm = torch.randperm(N, device=self.device)[:self.knn_subsample]
             self.register_buffer('X_train_knn', self.X_train[perm])
             self.register_buffer('y_train_knn', self.y_train[perm])
-            self.register_buffer('left_float_train_knn', left_float_g[perm].bool())
+            self.register_buffer('bin_oh_train_knn', bin_oh_g[perm].bool())
         else:
             self.register_buffer('X_train_knn', self.X_train)
             self.register_buffer('y_train_knn', self.y_train)
-            self.register_buffer('left_float_train_knn', left_float_g.bool())
+            self.register_buffer('bin_oh_train_knn', bin_oh_g.bool())
 
     def on_train_epoch_start(self):
         self._train_step_outputs = []
@@ -532,7 +529,7 @@ class EC2Estimator(pl.LightningModule):
             targets = knn_ec2_target(
                 x, mask, self.X_train_knn, self.y_train_knn, self.feat_thresholds, k=self.k,
                 global_ec2_cache=self.global_ec2_cache,
-                left_float_train=self.left_float_train_knn,
+                bin_oh_train=self.bin_oh_train_knn,
             )  # [B, d_in]
 
             unobserved = (mask == 0).float()  # [B, d_in]
