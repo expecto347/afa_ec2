@@ -30,6 +30,10 @@ Jobs are submitted to SLURM via shell scripts (`sbatch <script>.sh`). **All trai
 | `run_syn2.sh` | Syn2 (synthetic) | `short` |
 | `run_syn3.sh` | Syn3 (synthetic) | `short` |
 | `run_metabric.sh` | Metabric | `short` |
+| `run_mnist_seeds.sh` | MNIST (20 STG pixels) | `long` |
+| `run_california_housing_seeds.sh` | California Housing (4-class) | `long` |
+| `run_miniboone_seeds.sh` | MiniBooNE (balanced binary) | `long` |
+| `run_fashion_mnist_seeds.sh` | Fashion MNIST (20 STG pixels) | `long` |
 
 Each script trains the model and then auto-evaluates the best checkpoint.
 
@@ -175,3 +179,27 @@ sbatch run_bank_marketing.sh
 | Metabric | 全部（z-score 基因表达） | 无（突变列未被选中） | 否 |
 | CUBE-NM | 全部 55 列 | 无 | 否 |
 | Bank Marketing | 10 列 | 53 个 one-hot dummy 列 | **是** |
+| MNIST | 20 列（STG 选出的像素，[0,1] 浮点） | 无 | 否 |
+| Fashion MNIST | 20 列（STG 选出的像素，[0,1] 浮点） | 无 | 否 |
+| California Housing | 全部 8 列 | 无（label 为 4 等频 bin） | 否 |
+| MiniBooNE | 20 列（STG 选出） | 无 | 否 |
+
+## MNIST / Fashion MNIST / California Housing / MiniBooNE 数据集
+
+四个数据集均走通用 CSV 路径（`ec2_tabular.py` + `evaluate_ec2_tabular.py`，与 CKD/Bank Marketing 相同），由对应 `prepare_*.py` 生成 `/data/users/haozhes/{mnist,fashion_mnist,california_housing,miniboone}/{train,val,test}.csv`，预处理与 SEFA/AFA-benchmark 保持一致：
+
+- **MNIST**：展平为 784 维后取 STG 选出的 20 个像素（`prepare_mnist.py` 内 `BEST_FEATURES`），10 类，指标 accuracy，划分 50000/10000/10000（官方 test）。原始文件已在本仓库 `data/MNIST/raw`，不会触发下载。
+- **Fashion MNIST**：与 MNIST 相同流程（`prepare_fashion_mnist.py` 内 `BEST_FEATURES`），10 类，指标 accuracy，划分 50000/10000/10000（官方 test）。原始文件由 torchvision 自动下载到 `data/FashionMNIST/raw`（首次运行 prepare 时）。
+- **California Housing**：sklearn 自动下载，8 个连续特征；回归目标按分位数离散化为 4 个等频 bin，指标 accuracy，划分 16512/2064/2064。
+- **MiniBooNE**：UCI 自动下载（`prepare_miniboone.py` 内 `UCI_ZIP_URL`）；负类降采样至 40000 强制类别平衡（36499 正 / 40000 负），取 STG 选出的 20 个特征，二分类，指标 AUROC，划分 56499/10000/10000。
+
+运行方式（train + eval 一键完成，prepare 脚本由 array task 0 自动执行）：
+
+```bash
+sbatch run_mnist_seeds.sh
+sbatch run_california_housing_seeds.sh
+sbatch run_miniboone_seeds.sh
+sbatch run_fashion_mnist_seeds.sh
+```
+
+四者也均已注册进 `run_all_seeds.sh` 和 `plot_results.py` 的 `datasets` 列表。
