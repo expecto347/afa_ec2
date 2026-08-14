@@ -24,10 +24,10 @@ from ec2_core import (
 
 # CUBE-NM (afa_context_v2) noise configuration
 CUBE_NM_KWARGS = dict(
-    context_feature_std=0.1,
-    informative_feature_std=0.3,
+    context_feature_std=0,
+    informative_feature_std=0,
     non_informative_feature_mean=0.5,
-    non_informative_feature_std=0.3,
+    non_informative_feature_std=0,
     use_cheap_context_features=True,
     n_contexts=5,
 )
@@ -70,7 +70,7 @@ def parse_args():
     parser.add_argument("--pretrain_epochs", type=int, default=100)
     parser.add_argument("--train_epochs", type=int, default=250)
     parser.add_argument("--max_features", type=int, default=14,
-                        help="Acquisition steps per training episode (benchmark evals up to budget 14)")
+                        help="Acquisition steps per training episode (max 55 = full budget)")
     parser.add_argument("--n_samples_total", type=int, default=6250,
                         help="Total samples generated; 80%% train / 20%% val → 5000/1250")
     parser.add_argument("--log_dir", type=str, default="logs")
@@ -80,7 +80,24 @@ def parse_args():
     parser.add_argument("--disable_early_stopping", action="store_true")
     parser.add_argument("--k", type=int, default=50,
                         help="kNN neighbors (50/5000 ≈ 1%% of training set)")
+    parser.add_argument("--n_bins", type=int, default=10,
+                        help="Discretization bins for kNN EC2 targets")
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--eps", type=float, default=0.1,
+                        help="Epsilon-greedy exploration probability")
+    parser.add_argument("--eps_decay", type=float, default=0.2)
+    parser.add_argument("--eps_steps", type=int, default=8)
+    parser.add_argument("--random_first_step", action="store_true",
+                        help="First acquisition of every episode is random (better coverage)")
+    parser.add_argument("--pretrain_retention_max", type=float, default=1.0,
+                        help="Max per-feature retention in pretrain masks (1.0 = default "
+                             "U(0,1); lower biases toward low budgets)")
+    parser.add_argument("--pretrain_retention_mix", type=float, default=0.0,
+                        help="Fraction of pretrain masks kept at full range when "
+                             "pretrain_retention_max < 1 (preserves high-budget ability)")
+    parser.add_argument("--hidden", type=int, default=512)
+    parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--run_name", type=str, default="ec2_cube_nm_trial_0")
     return parser.parse_args()
 
@@ -118,7 +135,7 @@ def main():
 
     X_train_tensor = train_data.features.clone()
     y_train_tensor = train_data.labels.clone()
-    feat_thresholds = compute_feature_thresholds(X_train_tensor)
+    feat_thresholds = compute_feature_thresholds(X_train_tensor, n_bins=args.n_bins)
 
     train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
                                   pin_memory=True, num_workers=args.num_workers, drop_last=True)
@@ -127,8 +144,8 @@ def main():
 
     d_in    = 55
     d_out   = 8
-    hidden  = 512
-    dropout = 0.3
+    hidden  = args.hidden
+    dropout = args.dropout
 
     predictor  = Predictor(d_in, d_out, hidden, dropout)
     mask_layer = MaskLayer(mask_size=d_in, append=True)
@@ -145,7 +162,11 @@ def main():
 
     # --- Phase 1: Pretrain Predictor ---
     print("Pretraining Predictor...")
-    pred_pretrainer = PredictorPretrainer(predictor, mask_layer, lr=1e-3)
+    pred_pretrainer = PredictorPretrainer(
+        predictor, mask_layer, lr=args.lr,
+        mask_retention_max=args.pretrain_retention_max,
+        mask_retention_mix=args.pretrain_retention_mix,
+    )
     pred_logger = TensorBoardLogger(args.log_dir, name=args.run_name, version="pretrain_predictor")
     pred_callbacks = [TQDMProgressBar(refresh_rate=50)]
     if not args.disable_early_stopping:
@@ -170,9 +191,12 @@ def main():
         feat_mean=feat_mean,
         feat_std=feat_std,
         k=args.k,
-        lr=1e-3, min_lr=1e-6,
+        lr=args.lr, min_lr=1e-6,
         max_features=args.max_features,
-        eps=0.1,
+        eps=args.eps,
+        eps_decay=args.eps_decay,
+        eps_steps=args.eps_steps,
+        random_first_step=args.random_first_step,
         patience=args.patience,
         disable_early_stopping=args.disable_early_stopping,
     )

@@ -3,14 +3,14 @@
 #SBATCH -c 8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH -t 30:00
-#SBATCH -p short
+#SBATCH -t 3:30:00
+#SBATCH -p long
 #SBATCH -o logs/%j.out
 
 cd ~/AFA_EC2
 
 apptainer exec --nv afa_env.sif python -u ec2_cube_nm.py \
-    --k 50 --patience 20 --max_features 14 --batch_size 64
+    --k 50 --patience 20 --max_features 55 --batch_size 64
 
 CKPT_DIR="logs/ec2_cube_nm_trial_0/ec2_train/checkpoints"
 CKPT=$(ls -t "${CKPT_DIR}"/best_val_perf_model*.ckpt 2>/dev/null | head -1)

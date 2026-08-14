@@ -1,12 +1,14 @@
 """
 Evaluate a trained CUBE-NM EC2 kNN checkpoint.
 
-Reports accuracy at benchmark budget levels [0, 3, 5, 7, 10, 14] for both
-EC2 greedy acquisition and a random baseline. Test set is generated with
-seed = train_seed + 100 (separate from training data).
+Reports accuracy at every budget from 0 to D_IN (55) — acquisition only stops
+after all features have been used — for both EC2 greedy acquisition and a
+random baseline. Test set is generated with seed = train_seed + 100 (separate
+from training data).
 """
 
 import argparse
+import json
 import os
 import numpy as np
 import torch
@@ -21,11 +23,16 @@ from ec2_core import Predictor, EC2Estimator, MaskLayer
 from ec2_cube_nm import CubeNMDataset, CUBE_NM_KWARGS
 from eval_utils import run_dir_from_checkpoint, save_eval_results, auc_under_curve, append_to_results_log
 
-BENCHMARK_BUDGETS = [0, 3, 5, 7, 10, 14]
 D_IN    = 55
 D_OUT   = 8
 HIDDEN  = 512
 DROPOUT = 0.3
+
+# Context one-hot features occupy indices [0, n_contexts): observing any one of
+# them determines the context and thus which 10-dim block is informative.
+# Optimal policy: pick 1 context feature first, then block features.
+N_CONTEXTS = CUBE_NM_KWARGS["n_contexts"]
+CONTEXT_FEATURES = list(range(N_CONTEXTS))
 
 
 def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
@@ -40,18 +47,23 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
     y_train         = ckpt["state_dict"]["y_train"]
     feat_thresholds = ckpt["state_dict"]["feat_thresholds"]
 
+    # Infer hidden sizes from the checkpoint so hyperparameter variants
+    # (e.g. --hidden 1024) evaluate correctly.
+    hidden_vn = ckpt["state_dict"]["value_network.0.weight"].shape[0]
+    hidden_p  = ckpt["state_dict"]["predictor.net.0.weight"].shape[0]
+
     # Test set: separate seed from training
     test_afa = AFAContextDataset(n_samples=n_test, seed=seed + 100, **CUBE_NM_KWARGS)
     test_data = CubeNMDataset(test_afa, mean=feat_mean, std=feat_std)
     test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
     print(f"Test set: {len(test_data)} samples")
 
-    predictor  = Predictor(D_IN, D_OUT, HIDDEN, DROPOUT)
+    predictor  = Predictor(D_IN, D_OUT, hidden_p, DROPOUT)
     mask_layer = MaskLayer(mask_size=D_IN, append=True)
     value_network = nn.Sequential(
-        nn.Linear(D_IN * 2, HIDDEN), nn.ReLU(), nn.Dropout(DROPOUT),
-        nn.Linear(HIDDEN, HIDDEN),   nn.ReLU(), nn.Dropout(DROPOUT),
-        nn.Linear(HIDDEN, D_IN),
+        nn.Linear(D_IN * 2, hidden_vn), nn.ReLU(), nn.Dropout(DROPOUT),
+        nn.Linear(hidden_vn, hidden_vn), nn.ReLU(), nn.Dropout(DROPOUT),
+        nn.Linear(hidden_vn, D_IN),
     )
 
     # strict=False: global_ec2_cache and left_float_train are registered as buffers
@@ -74,17 +86,22 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
     ).to(device)
     model.eval()
 
-    max_budget = max(BENCHMARK_BUDGETS)
+    # Acquire features until all D_IN features have been used
+    max_budget = D_IN
     all_preds_ec2  = [[] for _ in range(max_budget + 1)]
     all_preds_rand = [[] for _ in range(max_budget + 1)]
     all_y = []
     # selection_counts[feat, step-1] = number of times feat was chosen at that step
     selection_counts = np.zeros((D_IN, max_budget), dtype=np.int64)
+    # context_first_step[i] = acquisition step (1-based) at which sample i first
+    # selected a context feature (NaN if never, within max_budget)
+    context_first_step = np.full(len(test_data), np.nan)
 
     print("Evaluating...")
     with torch.no_grad():
-        for x, y in test_loader:
-            x, y = x.to(device), y.to(device)
+        for batch_start in range(0, len(test_data), batch_size):
+            x = test_data.features[batch_start:batch_start + batch_size].to(device)
+            y = test_data.labels[batch_start:batch_start + batch_size].to(device)
             mask_ec2  = torch.zeros(len(x), D_IN, dtype=x.dtype, device=device)
             mask_rand = torch.zeros(len(x), D_IN, dtype=x.dtype, device=device)
 
@@ -105,6 +122,11 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
                 best_np = best.cpu().numpy()
                 for feat_idx in best_np:
                     selection_counts[feat_idx, step - 1] += 1
+                # record first step at which each sample picks a context feature
+                is_context = np.isin(best_np, CONTEXT_FEATURES)
+                local_sel = batch_start + np.arange(len(x))[is_context]
+                step_filled = np.isnan(context_first_step[local_sel])
+                context_first_step[local_sel[step_filled]] = step
                 upd = torch.zeros_like(mask_ec2)
                 upd.scatter_(1, best.unsqueeze(1), 1.0)
                 mask_ec2 = torch.max(mask_ec2, upd)
@@ -193,7 +215,6 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
         "final_acc":       ec2_accs[-1],
         "rand_final_acc":  rand_accs[-1],
         "max_budget":      max_budget,
-        "benchmark_budgets": str(BENCHMARK_BUDGETS),
     }
     append_to_results_log(run_name, "cube_nm", summary)
 
@@ -205,6 +226,46 @@ def evaluate(checkpoint_path, gpu, seed, n_test, batch_size, output_plot):
         counts = selection_counts[top5, s]
         items = ", ".join(f"feat{f}({c})" for f, c in zip(top5, counts))
         print(f"{s+1:<6} | {items}")
+
+    # ── Context-first statistics ─────────────────────────────────────────────
+    # Context features [0, n_contexts) are one-hot: one observation determines
+    # the informative block. Optimal behavior: pick a context feature at step 1.
+    n_test_samples = len(test_data)
+    first_sel = np.argmax(selection_counts, axis=0)          # most-picked feat per step
+    ctx_frac_per_step = (selection_counts[CONTEXT_FEATURES].sum(axis=0) /
+                         np.maximum(1, selection_counts.sum(axis=0)))
+    ctx_first_valid = context_first_step[~np.isnan(context_first_step)]
+    stats = {
+        "n_contexts": N_CONTEXTS,
+        "context_features": CONTEXT_FEATURES,
+        "first_step_most_picked_feature": int(first_sel[0]),
+        "first_step_picks_context_frac": float(ctx_frac_per_step[0]),
+        "first_3_steps_most_picked_are_context": float(np.mean(np.isin(first_sel[:3], CONTEXT_FEATURES))),
+        "ctx_frac_per_step": [float(v) for v in ctx_frac_per_step],
+        "mean_step_of_first_context_selection": float(np.mean(ctx_first_valid)) if len(ctx_first_valid) else None,
+        "median_step_of_first_context_selection": float(np.median(ctx_first_valid)) if len(ctx_first_valid) else None,
+        "budget_of_first_perfect_acc": int(next((b for b, a in enumerate(ec2_accs) if a >= 1.0), -1)),
+    }
+    # frac of samples that picked a context feature within the first 10 steps
+    first_ctx_within_10 = context_first_step <= 10   # NaN → False
+    stats["frac_context_within_first_10_steps"] = float(np.mean(first_ctx_within_10)) if n_test_samples else 0.0
+    stats["frac_never_selected_context_in_first_10_steps"] = float(np.mean(~first_ctx_within_10))
+
+    print(f"\n{'='*60}")
+    print("Context-first analysis (context features = indices "
+          f"{CONTEXT_FEATURES}, one-hot)")
+    print("="*60)
+    print(f"Step 1 most-picked feature:           feat{first_sel[0]} "
+          f"(context fraction {ctx_frac_per_step[0]:.3f})")
+    print(f"Mean 1st context selection at step:   {stats['mean_step_of_first_context_selection']:.2f} "
+          f"(median {stats['median_step_of_first_context_selection']:.0f})")
+    print(f"Frac context selected within 10 steps:{stats['frac_context_within_first_10_steps']:.3f}")
+    print(f"Budget of first perfect accuracy:     {stats['budget_of_first_perfect_acc']}")
+
+    ctx_stats_path = os.path.join(run_dir, "context_stats.json")
+    with open(ctx_stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Context stats saved → {ctx_stats_path}")
 
 
 if __name__ == "__main__":

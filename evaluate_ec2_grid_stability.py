@@ -64,6 +64,7 @@ def evaluate_ec2(checkpoint_path, data_dir, gpu):
         lr=1e-3,
         max_features=max_features,
         eps=0.1,
+        strict=False,  # tolerate kNN cache buffers (global_ec2_cache, X_train_knn, ...) registered in on_fit_start
     ).to(device)
 
     model.eval()

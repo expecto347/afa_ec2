@@ -158,7 +158,7 @@ def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
             p_bin_cls  = bin_counts  / (bin_totals.unsqueeze(1) + 1e-8)
             gini_bin  = 1.0 - p_bin_cls.pow(2).sum(dim=1)   # [B_nz, d_in, n_bins]
             p_bin  = bin_totals  / k
-            scores  = (p_bin.pow(3) * gini_bin).sum(dim=-1)
+            scores  = (p_bin.pow(2) * gini_bin).sum(dim=-1)
             ec2_scores[nonzero_mask_rows] = scores
 
     return ec2_scores
@@ -324,7 +324,7 @@ class PVAEPretrainer(pl.LightningModule):
 
 class PredictorPretrainer(pl.LightningModule):
     def __init__(self, predictor, mask_layer, lr, factor=0.5, patience=10, min_lr=1e-6,
-                 class_weights=None):
+                 class_weights=None, mask_retention_max=1.0, mask_retention_mix=0.0):
         super().__init__()
         self.predictor = predictor
         self.mask_layer = mask_layer
@@ -334,12 +334,28 @@ class PredictorPretrainer(pl.LightningModule):
         self.min_lr = min_lr
         self.mask_size = mask_layer.mask_size
         self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+        # Defaults (max=1.0, mix=0.0) = current behavior: per-feature retention
+        # ~ U(0,1) (mean 50%).  mask_retention_max < 1 biases masks toward the
+        # low budgets EC2 evaluation actually visits (1-10 features observed);
+        # mask_retention_mix is the fraction of masks kept at full range so the
+        # predictor does not forget the high-budget regime.
+        self.mask_retention_max = mask_retention_max
+        self.mask_retention_mix = mask_retention_mix
+
+    def _sample_mask(self, x):
+        if self.mask_retention_max >= 1.0:
+            mask = torch.rand(len(x), self.mask_size, device=x.device)
+            ref = torch.rand(len(x), 1, device=x.device)
+            return (mask > ref).float()
+        full = torch.rand(len(x), 1, device=x.device) < self.mask_retention_mix
+        ret = torch.rand(len(x), 1, device=x.device)
+        ret = torch.where(full, ret, ret * self.mask_retention_max)
+        mask = torch.rand(len(x), self.mask_size, device=x.device)
+        return (mask < ret).float()
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        mask = torch.rand(len(x), self.mask_size, device=x.device)
-        ref = torch.rand(len(x), 1, device=x.device)
-        mask = (mask > ref).float()
+        mask = self._sample_mask(x)
 
         x_masked = self.mask_layer(x, mask)
         pred = self.predictor(x_masked)
@@ -350,9 +366,7 @@ class PredictorPretrainer(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        mask = torch.rand(len(x), self.mask_size, device=x.device)
-        ref = torch.rand(len(x), 1, device=x.device)
-        mask = (mask > ref).float()
+        mask = self._sample_mask(x)
 
         x_masked = self.mask_layer(x, mask)
         pred = self.predictor(x_masked)
@@ -365,9 +379,7 @@ class PredictorPretrainer(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         x, y = batch
-        mask = torch.rand(len(x), self.mask_size, device=x.device)
-        ref = torch.rand(len(x), 1, device=x.device)
-        mask = (mask > ref).float()
+        mask = self._sample_mask(x)
 
         x_masked = self.mask_layer(x, mask)
         pred = self.predictor(x_masked)
@@ -395,6 +407,7 @@ class EC2Estimator(pl.LightningModule):
                  knn_subsample=None,
                  factor=0.5, patience=10, min_lr=1e-6, disable_early_stopping=False,
                  random_first_step=False,
+                 eps_decay=0.2, eps_steps=8,
                  val_monitor='accuracy',
                  feature_groups=None):
         super().__init__()
@@ -424,8 +437,8 @@ class EC2Estimator(pl.LightningModule):
         self.feature_costs = torch.ones(self.mask_size)
 
         self.eps = eps
-        self.eps_decay = 0.2
-        self.eps_steps = 8
+        self.eps_decay = eps_decay
+        self.eps_steps = eps_steps
         self.early_stopping_epochs = patience + 1
         self.automatic_optimization = False
         self.val_monitor = val_monitor
