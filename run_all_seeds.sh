@@ -30,13 +30,28 @@ echo "=== Submitting Bank Marketing (seeds 0-2) ==="
 JOB_BANK=$(sbatch --parsable run_bank_marketing_seeds.sh)
 echo "  Job ID: ${JOB_BANK}"
 
+echo "=== Submitting MNIST (seeds 0-2) ==="
+JOB_MNIST=$(sbatch --parsable run_mnist_seeds.sh)
+echo "  Job ID: ${JOB_MNIST}"
+
+echo "=== Submitting California Housing (seeds 0-2) ==="
+JOB_CAL=$(sbatch --parsable run_california_housing_seeds.sh)
+echo "  Job ID: ${JOB_CAL}"
+
+echo "=== Submitting MiniBooNE (seeds 0-2) ==="
+JOB_MINI=$(sbatch --parsable run_miniboone_seeds.sh)
+echo "  Job ID: ${JOB_MINI}"
+
 echo ""
 echo "All jobs submitted."
-echo "  Grid Stability : ${JOB_GS}   (array 0-2)"
-echo "  CUBE-NM        : ${JOB_CUBE}  (array 0-2)"
-echo "  CKD            : ${JOB_CKD}   (array 0-2)"
-echo "  Metabric       : ${JOB_META}  (array 0-2)"
-echo "  Bank Marketing : ${JOB_BANK}  (array 0-2)"
+echo "  Grid Stability    : ${JOB_GS}   (array 0-2)"
+echo "  CUBE-NM           : ${JOB_CUBE}  (array 0-2)"
+echo "  CKD               : ${JOB_CKD}   (array 0-2)"
+echo "  Metabric          : ${JOB_META}  (array 0-2)"
+echo "  Bank Marketing    : ${JOB_BANK}  (array 0-2)"
+echo "  MNIST             : ${JOB_MNIST}  (array 0-2)"
+echo "  California Housing: ${JOB_CAL}  (array 0-2)"
+echo "  MiniBooNE         : ${JOB_MINI}  (array 0-2)"
 echo ""
 echo "Monitor with: squeue -u \$USER"
 echo "Results will accumulate in: results_log.csv"
