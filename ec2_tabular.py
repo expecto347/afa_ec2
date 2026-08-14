@@ -99,6 +99,8 @@ def parse_args():
     parser.add_argument("--pretrain_only", action="store_true")
     parser.add_argument("--disable_early_stopping", action="store_true")
     parser.add_argument("--k", type=int, default=50, help="Number of kNN neighbors")
+    parser.add_argument("--n_bins", type=int, default=10,
+                        help="Number of bins for Gini discretization in kNN EC2 targets")
     parser.add_argument("--knn_subsample", type=int, default=None,
                         help="Cap X_train reference set for kNN to this many samples "
                              "(reduces the [B,N,d] distance tensor when N is large)")
@@ -141,7 +143,7 @@ def main():
         col_idx = args.label_col if args.label_col >= 0 else raw_train_df.shape[1] + args.label_col
         y_raw = raw_train_df.iloc[:, col_idx].values.astype(np.int64)
     y_train_tensor = torch.tensor(y_raw)
-    feat_thresholds = compute_feature_thresholds(X_train_tensor)
+    feat_thresholds = compute_feature_thresholds(X_train_tensor, n_bins=args.n_bins)
 
     # Fix 3: load feature groups (produced by prepare_bank_marketing.py)
     groups_path = os.path.join(os.path.dirname(os.path.abspath(args.train_csv)), "feature_groups.json")

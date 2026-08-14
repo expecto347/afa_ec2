@@ -4,6 +4,17 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# 每个数据集的最佳超参数组合（来自 2026-08 HPS 搜索，曲线 AUC 最优，seed 0）
+# 优先绘制这些组合的曲线；不在表中的数据集回退到默认配置 ec2_<ds>_seed<seed>
+HPS_BEST_CONFIG = {
+    'mnist': (20, 4),
+    'miniboone': (5, 20),
+    'california_housing': (100, 4),
+    'grid_stability': (100, 4),
+    'metabric': (100, 20),
+    'ckd': (5, 4),
+}
+
 def load_baselines(dataset_name):
     script_path = f"scripts/plot_{dataset_name}.py"
     if not os.path.exists(script_path):
@@ -44,7 +55,15 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
     for seed in seeds:
         run_name = f"ec2_{dataset_name}_seed{seed}"
         csv_path = os.path.join("logs", run_name, "eval_results.csv")
-        
+
+        # 优先使用 HPS 搜索到的最佳超参数组合（若目录存在）
+        if dataset_name in HPS_BEST_CONFIG:
+            k, b = HPS_BEST_CONFIG[dataset_name]
+            best_name = f"ec2_{dataset_name}_k{k}_b{b}_seed{seed}"
+            best_path = os.path.join("logs", best_name, "eval_results.csv")
+            if os.path.exists(best_path):
+                run_name, csv_path = best_name, best_path
+
         if not os.path.exists(csv_path):
             print(f"Warning: Data file not found for {run_name} at {csv_path}")
             continue
@@ -76,8 +95,12 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
                         value_name=metric.upper())
     
     # 替换策略名称使得图例更美观
+    ec2_label = 'EC2 (Ours)'
+    if dataset_name in HPS_BEST_CONFIG:
+        k, b = HPS_BEST_CONFIG[dataset_name]
+        ec2_label = f'EC2 (Ours) k={k} b={b}'
     melted_df['Strategy'] = melted_df['Strategy'].map({
-        target_metric: 'EC2 (Ours)',
+        target_metric: ec2_label,
         rand_metric: 'Random'
     })
 
@@ -118,6 +141,11 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
         baseline_df = pd.DataFrame(baseline_records)
         melted_df = pd.concat([melted_df, baseline_df], ignore_index=True)
 
+    if dataset_name == 'bank_marketing':
+        melted_df = melted_df[melted_df['budget'] < 10]
+    elif dataset_name == 'cube_nm':
+        melted_df = melted_df[melted_df['budget'] <= 55]
+
     # 设置绘图风格
     sns.set_theme(style="whitegrid")
     plt.figure(figsize=(8, 6))
@@ -140,10 +168,11 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
 
 if __name__ == "__main__":
     # 您可以根据 run_all_seeds.sh 中的任务指定需要画图的数据集名称
-    datasets = ['grid_stability', 'cube_nm', 'ckd', 'metabric', 'bank_marketing']
+    datasets = ['grid_stability', 'cube_nm', 'ckd', 'metabric', 'bank_marketing',
+                'mnist', 'california_housing', 'miniboone']
     
     for ds in datasets:
-        # 画出 Accuracy 曲线
-        plot_dataset_curves(ds, metric='acc')
+        # 画出 Accuracy 曲线（EC2 用 HPS 最佳组合的 seed 0 结果）
+        plot_dataset_curves(ds, seeds=[0], metric='acc')
         # 画出 AUROC 曲线
-        plot_dataset_curves(ds, metric='auroc')
+        plot_dataset_curves(ds, seeds=[0], metric='auroc')

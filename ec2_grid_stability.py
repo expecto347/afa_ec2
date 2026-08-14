@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument("--pretrain_only", action="store_true", help="Only pretrain PVAE and predictor")
     parser.add_argument("--disable_early_stopping", action="store_true", help="Disable early stopping")
     parser.add_argument("--k", type=int, default=50, help="Number of kNN neighbors")
+    parser.add_argument("--n_bins", type=int, default=10,
+                        help="Number of bins for Gini discretization in kNN EC2 targets")
     parser.add_argument("--patience", type=int, default=20, help="LR scheduler patience and early-stopping patience")
     parser.add_argument("--run_name", type=str, default="ec2_grid_stability_trial_0")
     return parser.parse_args()
@@ -65,7 +67,7 @@ def main():
     feat_std  = scaler.scale_.astype(np.float32)
     X_train_tensor = torch.tensor((X_raw - feat_mean) / (feat_std + 1e-8))
     y_train_tensor = torch.tensor(raw_train_df.iloc[:, -1].values.astype(np.int64))
-    feat_thresholds = compute_feature_thresholds(X_train_tensor)
+    feat_thresholds = compute_feature_thresholds(X_train_tensor, n_bins=args.n_bins)
 
     train_data = GridStabilityDataset(os.path.join(args.data_dir, "train.csv"), mean=feat_mean, std=feat_std)
     val_data   = GridStabilityDataset(os.path.join(args.data_dir, "val.csv"),   mean=feat_mean, std=feat_std)

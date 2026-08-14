@@ -136,6 +136,8 @@ def parse_args():
     parser.add_argument("--pretrain_only", action="store_true")
     parser.add_argument("--disable_early_stopping", action="store_true")
     parser.add_argument("--k", type=int, default=50, help="kNN neighbors for EC2 target computation")
+    parser.add_argument("--n_bins", type=int, default=10,
+                        help="Number of bins for Gini discretization in kNN EC2 targets")
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--random_first_step", action="store_true",
                         help="Force step-0 action to be uniformly random during training")
@@ -158,7 +160,7 @@ def main():
     print(f"Dataset={args.dataset}  d_in={d_in}  d_out={d_out}  max_features={max_features}")
     print(f"Train={len(X_train_t)}  Val={len(X_val_t)}  Test={len(X_test_t)}")
 
-    feat_thresholds = compute_feature_thresholds(X_train_t)
+    feat_thresholds = compute_feature_thresholds(X_train_t, n_bins=args.n_bins)
 
     train_dl = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=args.batch_size,
                           shuffle=True, pin_memory=True, num_workers=args.num_workers, drop_last=True)
