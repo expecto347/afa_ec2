@@ -158,7 +158,7 @@ def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
             p_bin_cls  = bin_counts  / (bin_totals.unsqueeze(1) + 1e-8)
             gini_bin  = 1.0 - p_bin_cls.pow(2).sum(dim=1)   # [B_nz, d_in, n_bins]
             p_bin  = bin_totals  / k
-            scores  = (p_bin.pow(2) * gini_bin).sum(dim=-1)
+            scores  = (p_bin.pow(3) * gini_bin).sum(dim=-1)
             ec2_scores[nonzero_mask_rows] = scores
 
     return ec2_scores

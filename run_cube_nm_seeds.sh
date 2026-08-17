@@ -14,7 +14,7 @@ RUN_NAME="ec2_cube_nm_seed${SEED}"
 cd ~/AFA_EC2
 
 apptainer exec --nv afa_env.sif python -u ec2_cube_nm.py \
-    --k 50 --patience 20 --max_features 14 --batch_size 64 \
+    --k 50 --patience 20 --max_features 55 --batch_size 64 \
     --seed $SEED --run_name "$RUN_NAME"
 
 CKPT_DIR="logs/${RUN_NAME}/ec2_train/checkpoints"
