@@ -42,6 +42,14 @@ echo "=== Submitting MiniBooNE (seeds 0-2) ==="
 JOB_MINI=$(sbatch --parsable run_miniboone_seeds.sh)
 echo "  Job ID: ${JOB_MINI}"
 
+echo "=== Submitting Syn1/2/3 (seeds 0-2) ==="
+JOB_SYN1=$(DATASET=syn1 sbatch --parsable run_syn_seeds.sh)
+JOB_SYN2=$(DATASET=syn2 sbatch --parsable run_syn_seeds.sh)
+JOB_SYN3=$(DATASET=syn3 sbatch --parsable run_syn_seeds.sh)
+echo "  Syn1: ${JOB_SYN1}"
+echo "  Syn2: ${JOB_SYN2}"
+echo "  Syn3: ${JOB_SYN3}"
+
 echo ""
 echo "All jobs submitted."
 echo "  Grid Stability    : ${JOB_GS}   (array 0-2)"
@@ -52,6 +60,9 @@ echo "  Bank Marketing    : ${JOB_BANK}  (array 0-2)"
 echo "  MNIST             : ${JOB_MNIST}  (array 0-2)"
 echo "  California Housing: ${JOB_CAL}  (array 0-2)"
 echo "  MiniBooNE         : ${JOB_MINI}  (array 0-2)"
+echo "  Syn1              : ${JOB_SYN1}  (array 0-2)"
+echo "  Syn2              : ${JOB_SYN2}  (array 0-2)"
+echo "  Syn3              : ${JOB_SYN3}  (array 0-2)"
 echo ""
 echo "Monitor with: squeue -u \$USER"
 echo "Results will accumulate in: results_log.csv"
