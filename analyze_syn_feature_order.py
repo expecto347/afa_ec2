@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import os
 
@@ -237,12 +238,15 @@ def main():
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--syn_seed", type=int, default=8139)
+    parser.add_argument("--tag", type=str, default="",
+                        help="Run-name infix, e.g. _final -> logs/ec2_<ds>_final_seed<s> (newest checkpoint is used)")
     args = parser.parse_args()
 
     selections_list, branch_masks_list, cov_stats_list = [], [], []
     for seed in args.seeds:
-        ckpt = os.path.join(LOGS_ROOT, f"ec2_{args.dataset}_seed{seed}",
-                            "ec2_train", "checkpoints", "best_val_perf_model.ckpt")
+        cands = glob.glob(os.path.join(LOGS_ROOT, f"ec2_{args.dataset}{args.tag}_seed{seed}",
+                                       "ec2_train", "checkpoints", "best_val_perf_model*.ckpt"))
+        ckpt = max(cands, key=os.path.getmtime) if cands else ""
         if not os.path.exists(ckpt):
             print(f"WARNING: checkpoint not found, skipping: {ckpt}")
             continue
@@ -262,7 +266,7 @@ def main():
     agg = _recursive_mean(cov_stats_list)
     print(json.dumps(agg, indent=2))
 
-    out_json = os.path.join(LOGS_ROOT, f"{args.dataset}_feature_order.json")
+    out_json = os.path.join(LOGS_ROOT, f"{args.dataset}{args.tag}_feature_order.json")
     with open(out_json, "w") as f:
         json.dump({"dataset": args.dataset, "seeds": args.seeds, "n_samples_per_seed": total // len(selections_list),
                    "selection_counts": {"overall": c_all.tolist(), "branch1": c_b1.tolist(), "branch2": c_b2.tolist()},
@@ -271,7 +275,7 @@ def main():
 
     save_heatmap(args.dataset, c_all, c_b1, c_b2,
                  os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              f"{args.dataset}_feature_order.png"))
+                              f"{args.dataset}{args.tag}_feature_order.png"))
 
 
 if __name__ == "__main__":

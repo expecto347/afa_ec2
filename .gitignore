@@ -9,3 +9,7 @@ afa_env.sif
 archive
 pretrain_eval_outputs
 slurm-*.out
+# plot output (curated copies live in results/figures)
+figure/
+!results/figures/*.png
+unpin_ganymede.sh

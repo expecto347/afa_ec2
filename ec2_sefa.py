@@ -22,6 +22,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 from ec2_core import (
+    finetune_predictor_on_policy, lookahead_init_scores,
     EC2Estimator,
     MaskLayer,
     Predictor,
@@ -139,6 +140,26 @@ def parse_args():
     parser.add_argument("--n_bins", type=int, default=10,
                         help="Number of bins for Gini discretization in kNN EC2 targets")
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--restore_best_predictor", action="store_true",
+                        help="After pretraining, reload the predictor weights of the best validation epoch")
+    parser.add_argument("--predictor_dropout", type=float, default=0.0,
+                        help="Dropout applied inside the predictor (0 = historical behaviour)")
+    parser.add_argument("--finetune_predictor", action="store_true",
+                        help="Phase 3: fine-tune the predictor on the learned policy's masks")
+    parser.add_argument("--unbiased_target", action="store_true",
+                        help="Unbiased (U-statistic) estimate of the kNN EC2 target")
+    parser.add_argument("--region_target", action="store_true",
+                        help="Use decision-region labels (predictor's full-feature argmax) in the target")
+    parser.add_argument("--lookahead_init", type=int, default=0,
+                        help="Anchor the first acquisition to an L-step lookahead EC2 target (0 = off)")
+    parser.add_argument("--lookahead_bins", type=int, default=4)
+    parser.add_argument("--fast_knn", action="store_true",
+                        help="Compute the masked kNN distance with matmuls (same neighbours up to ties)")
+    parser.add_argument("--knn_subsample", type=int, default=None,
+                        help="Cap the kNN reference set to this many training samples")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Value-network learning rate")
+    parser.add_argument("--stop_patience", type=int, default=None,
+                        help="Stop when the validation metric has not improved for this many epochs")
     parser.add_argument("--random_first_step", action="store_true",
                         help="Force step-0 action to be uniformly random during training")
     return parser.parse_args()
@@ -171,6 +192,7 @@ def main():
 
     mask_layer    = MaskLayer(mask_size=d_in, append=True)
     predictor     = Predictor(d_in, d_out, args.hidden, args.dropout)
+    predictor.active_dropout = args.predictor_dropout
     value_network = nn.Sequential(
         nn.Linear(d_in * 2, args.hidden), nn.ReLU(), nn.Dropout(args.dropout),
         nn.Linear(args.hidden, args.hidden), nn.ReLU(), nn.Dropout(args.dropout),
@@ -185,6 +207,8 @@ def main():
         pred_callbacks.append(EarlyStopping(monitor="Loss Val/Total", patience=10, mode="min"))
     pred_trainer = build_trainer(args.pretrain_epochs, pred_logger, pred_callbacks, args.gpu)
     pred_trainer.fit(pred_pretrainer, train_dl, val_dl)
+    if args.restore_best_predictor:
+        pred_pretrainer.restore_best()
     pred_trainer.test(pred_pretrainer, dataloaders=test_dl)
 
     if args.pretrain_only:
@@ -192,12 +216,30 @@ def main():
         return
 
     print("Training EC2 Estimator...")
+    init_scores = None
+    if args.lookahead_init > 0:
+        init_scores = lookahead_init_scores(X_train_t.cpu().numpy(), y_train_t.cpu().numpy(),
+                                            L=args.lookahead_init, M=args.lookahead_bins)
+        print(f"Lookahead (L={args.lookahead_init}, M={args.lookahead_bins}) first-step ranking: "
+              f"{init_scores.argsort()[:5].tolist()}")
+    y_target = None
+    if args.region_target:
+        predictor.eval()
+        with torch.no_grad():
+            dev = next(predictor.parameters()).device
+            ones = torch.ones(min(len(X_train_t), 4096), X_train_t.shape[1], device=dev)
+            y_target = torch.cat([
+                predictor(mask_layer(X_train_t[i:i + 4096].to(dev), ones[:len(X_train_t[i:i + 4096])])).argmax(1).cpu()
+                for i in range(0, len(X_train_t), 4096)]).to(y_train_t.dtype)
+        print(f"Region labels: agree with observed labels on {(y_target == y_train_t).float().mean():.3f} of train")
     ec2_estimator = EC2Estimator(
         value_network, predictor, mask_layer,
+        unbiased_target=args.unbiased_target, y_target=y_target, init_scores=init_scores,
+        fast_knn=args.fast_knn, stop_patience=args.stop_patience,
         X_train=X_train_t, y_train=y_train_t,
         feat_thresholds=feat_thresholds,
         feat_mean=feat_mean, feat_std=feat_std,
-        k=args.k, lr=1e-3, min_lr=1e-6,
+        k=args.k, lr=args.lr, min_lr=1e-6, knn_subsample=args.knn_subsample,
         max_features=max_features, eps=0.1,
         patience=args.patience,
         disable_early_stopping=args.disable_early_stopping,
@@ -215,6 +257,17 @@ def main():
         args.gpu,
     )
     train_trainer.fit(ec2_estimator, train_dl, val_dl)
+
+    if args.finetune_predictor:
+        best_ckpt = train_trainer.checkpoint_callback.best_model_path
+        print(f"Fine-tuning predictor on policy trajectories (from {best_ckpt})")
+        ec2_estimator.load_state_dict(torch.load(best_ckpt, map_location="cpu")["state_dict"])
+        device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+        finetune_predictor_on_policy(ec2_estimator, train_dl, val_dl,
+                                     n_steps=ec2_estimator.max_features, device=device)
+        ft_path = best_ckpt.replace(".ckpt", "-ft.ckpt")
+        train_trainer.save_checkpoint(ft_path)
+        print(f"Saved fine-tuned checkpoint: {ft_path}")
 
 
 if __name__ == "__main__":

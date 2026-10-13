@@ -65,12 +65,26 @@ def compute_feature_thresholds(X_train, n_bins=10):
     return thresholds.T.contiguous()                 # [d_in, n_bins - 1]
 
 
-def _ec2_scores_from_bin_counts(bin_counts, bin_totals, N):
+def _ec2_unbiased(bin_counts, bin_totals, n, class_dim):
+    """Unbiased (U-statistic) estimate of sum_b p_b^3 Gini_b from multinomial counts.
+
+    p_b^3 Gini_b = p_b^3 - p_b * sum_y p_{b,y}^2; counting ordered triples of
+    distinct samples gives  sum_b (c_b - 2)(c_b^2 - sum_y c_{b,y}^2) / (n(n-1)(n-2)),
+    where c_b^2 - sum_y c_{b,y}^2 is the number of ordered pairs in bin b with
+    different labels (the conflict edges among the samples).
+    """
+    pairs = bin_totals.pow(2) - bin_counts.pow(2).sum(class_dim)
+    return ((bin_totals - 2).clamp(min=0) * pairs).sum(-1) / (n * (n - 1) * (n - 2))
+
+
+def _ec2_scores_from_bin_counts(bin_counts, bin_totals, N, unbiased=False):
     """Shared Gini + EC2 computation across multiple bins.
     bin_counts: [C, d_in, n_bins]
     bin_totals: [d_in, n_bins]
     Returns: [d_in]
     """
+    if unbiased:
+        return _ec2_unbiased(bin_counts, bin_totals, float(N), class_dim=0)
     p_bin_cls = bin_counts / (bin_totals[None, :, :] + 1e-8)  # [C, d_in, n_bins]
     gini_bin = 1.0 - p_bin_cls.pow(2).sum(0)                  # [d_in, n_bins]
     p_bin = bin_totals / N                                    # [d_in, n_bins]
@@ -79,7 +93,7 @@ def _ec2_scores_from_bin_counts(bin_counts, bin_totals, N):
 
 
 def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
-                   global_ec2_cache=None, bin_oh_train=None):
+                   global_ec2_cache=None, bin_oh_train=None, unbiased=False, X_train_sq=None):
     """
     EC2 targets for all features via kNN + multiple bin discretization.
 
@@ -121,7 +135,7 @@ def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
                 
                 bin_counts_g = torch.einsum('nc,ndp->cdp', labels_oh_g, bin_oh_g)
                 bin_totals_g = bin_oh_g.sum(dim=0)   # [d_in, n_bins]
-                global_ec2 = _ec2_scores_from_bin_counts(bin_counts_g, bin_totals_g, N)
+                global_ec2 = _ec2_scores_from_bin_counts(bin_counts_g, bin_totals_g, N, unbiased)
                 
             ec2_scores[zero_mask_rows] = global_ec2.unsqueeze(0).expand(
                 zero_mask_rows.sum(), -1
@@ -133,9 +147,23 @@ def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
             mask_nz = mask[nonzero_mask_rows]
             B_nz    = x_nz.shape[0]
 
-            diff    = (X_train[None, :, :] - x_nz[:, None, :]) * mask_nz[:, None, :]
-            dist_sq = diff.pow(2).sum(dim=-1)
-            _, indices = torch.topk(dist_sq, k, largest=False, dim=1)
+            if X_train_sq is not None:
+                # Fast path: shortlist 2k candidates with the matmul form of the masked
+                # distance (mask is binary),
+                #   sum_j m_j (x_j - X_j)^2 = m.X^2 - 2 (m*x).X + sum_j m_j x_j^2,
+                # which avoids the [B, N, d] tensor but loses precision to cancellation;
+                # then re-rank the shortlist with the exact distance.
+                approx = (mask_nz @ X_train_sq.T - 2.0 * (mask_nz * x_nz) @ X_train.T
+                          + (mask_nz * x_nz * x_nz).sum(1, keepdim=True))
+                n_cand = min(2 * k, X_train.shape[0])
+                _, cand = torch.topk(approx, n_cand, largest=False, dim=1)          # [B_nz, 2k]
+                exact = ((X_train[cand] - x_nz[:, None, :]) * mask_nz[:, None, :]).pow(2).sum(-1)
+                _, pos = torch.topk(exact, k, largest=False, dim=1)
+                indices = cand.gather(1, pos)
+            else:
+                diff    = (X_train[None, :, :] - x_nz[:, None, :]) * mask_nz[:, None, :]
+                dist_sq = diff.pow(2).sum(dim=-1)
+                _, indices = torch.topk(dist_sq, k, largest=False, dim=1)
 
             neighbor_labels   = y_train[indices]    # [B_nz, k]
             neighbor_features = X_train[indices]    # [B_nz, k, d_in]
@@ -155,18 +183,96 @@ def knn_ec2_target(x, mask, X_train, y_train, feat_thresholds, k=50,
             bin_counts  = torch.einsum('bkc,bkdp->bcdp', labels_oh, bin_oh)
             bin_totals  = bin_oh.sum(dim=1)   # [B_nz, d_in, n_bins]
 
-            p_bin_cls  = bin_counts  / (bin_totals.unsqueeze(1) + 1e-8)
-            gini_bin  = 1.0 - p_bin_cls.pow(2).sum(dim=1)   # [B_nz, d_in, n_bins]
-            p_bin  = bin_totals  / k
-            scores  = (p_bin.pow(3) * gini_bin).sum(dim=-1)
+            if unbiased:
+                scores = _ec2_unbiased(bin_counts, bin_totals, float(k), class_dim=1)
+            else:
+                p_bin_cls  = bin_counts  / (bin_totals.unsqueeze(1) + 1e-8)
+                gini_bin  = 1.0 - p_bin_cls.pow(2).sum(dim=1)   # [B_nz, d_in, n_bins]
+                p_bin  = bin_totals  / k
+                scores  = (p_bin.pow(3) * gini_bin).sum(dim=-1)
             ec2_scores[nonzero_mask_rows] = scores
 
     return ec2_scores
 
 
+def lookahead_init_scores(X, y, L=3, M=4):
+    """L-step lookahead EC2 score of every feature at the empty state (lower = better).
+
+    Exact on the training set, with M quantile bins per feature:
+        R_0(cell) = P(cell)^2 * Gini(cell)
+        R_L(cell) = min_j sum_b P(b | cell) R_{L-1}(cell & bin_j = b)
+        Q_L(i)    = sum_b P(b) R_{L-1}(bin_i = b)      (Q_1 = the one-step target)
+    """
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y).astype(np.int64)
+    N, d = X.shape
+    C = int(y.max()) + 1
+    B = np.empty((N, d), dtype=np.int64)
+    for i in range(d):
+        q = np.quantile(X[:, i], np.linspace(1 / M, 1 - 1 / M, M - 1))
+        B[:, i] = (X[:, i][:, None] > q[None, :]).sum(1)
+
+    def gini(idx):
+        p = np.bincount(y[idx], minlength=C) / len(idx)
+        return 1.0 - (p * p).sum()
+
+    def R(idx, used, depth):
+        if depth == 0 or len(idx) < 2:
+            return (len(idx) / N) ** 2 * (gini(idx) if len(idx) else 0.0)
+        best = np.inf
+        for j in range(d):
+            if j in used:
+                continue
+            bj = B[idx, j]
+            val = 0.0
+            for b in range(M):
+                sub = idx[bj == b]
+                if len(sub):
+                    val += len(sub) / len(idx) * R(sub, used | {j}, depth - 1)
+            best = min(best, val)
+        return best
+
+    all_idx = np.arange(N)
+    scores = np.zeros(d)
+    for i in range(d):
+        for b in range(M):
+            sub = all_idx[B[:, i] == b]
+            if len(sub):
+                scores[i] += len(sub) / N * R(sub, {i}, L - 1)
+    return torch.tensor(scores, dtype=torch.float32)
+
+
+def _anchor_value_network(module, init_scores):
+    """Make `module` return `init_scores` (ranked to [0, 1]) for rows with an all-zero mask.
+
+    The empty state is identical for every instance, so its acquisition can be read
+    off a cached, exactly computed target instead of the regression estimate.  The
+    forward is patched on the instance, so state_dict keys are unchanged.
+    """
+    rank = torch.argsort(torch.argsort(init_scores)).float()
+    anchor = rank / max(len(rank) - 1, 1)
+    orig = module.forward if not hasattr(module, "_orig_forward") else module._orig_forward
+    module._orig_forward = orig
+
+    def forward(x_masked):
+        out = orig(x_masked)
+        d = out.shape[1]
+        empty = x_masked[:, -d:].sum(1) == 0
+        if empty.any():
+            out = out.clone()
+            out[empty] = anchor.to(out.device, out.dtype)
+        return out
+
+    module.forward = forward
+
+
 class Predictor(nn.Module):
     def __init__(self, d_in, d_out, hidden, dropout=0.0):
         super().__init__()
+        # NOTE: `dropout` is historically ignored.  Set `active_dropout` > 0 to
+        # apply dropout after each hidden block; it is applied functionally so
+        # the state_dict keys (and old checkpoints) are unchanged.
+        self.active_dropout = 0.0
         self.net = nn.Sequential(
             nn.Linear(d_in * 2, hidden),
             nn.ReLU(),
@@ -178,7 +284,13 @@ class Predictor(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x)
+        if self.active_dropout <= 0.0:
+            return self.net(x)
+        for layer in self.net:
+            x = layer(x)
+            if isinstance(layer, nn.BatchNorm1d):
+                x = nn.functional.dropout(x, p=self.active_dropout, training=self.training)
+        return x
 
 
 class PVAE(nn.Module):
@@ -341,6 +453,9 @@ class PredictorPretrainer(pl.LightningModule):
         # predictor does not forget the high-budget regime.
         self.mask_retention_max = mask_retention_max
         self.mask_retention_mix = mask_retention_mix
+        # Best-epoch snapshot (by validation loss), see restore_best().
+        self._best_val_loss = float("inf")
+        self._best_state = None
 
     def _sample_mask(self, x):
         if self.mask_retention_max >= 1.0:
@@ -377,6 +492,24 @@ class PredictorPretrainer(pl.LightningModule):
         self.log("Acc Val/Predictor", acc, prog_bar=True, logger=True)
         return loss
 
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            return
+        val_loss = self.trainer.callback_metrics.get("Loss Val/Total")
+        if val_loss is not None and float(val_loss) < self._best_val_loss:
+            self._best_val_loss = float(val_loss)
+            self._best_state = {k: v.detach().clone() for k, v in self.predictor.state_dict().items()}
+
+    def restore_best(self):
+        """Load the predictor weights of the epoch with the lowest validation loss.
+
+        EarlyStopping alone leaves the weights of the *last* epoch, which is
+        `patience` epochs past the best one.
+        """
+        if self._best_state is not None:
+            self.predictor.load_state_dict(self._best_state)
+            print(f"Restored best predictor (val loss {self._best_val_loss:.4f})")
+
     def test_step(self, batch, batch_idx):
         x, y = batch
         mask = self._sample_mask(x)
@@ -409,13 +542,30 @@ class EC2Estimator(pl.LightningModule):
                  random_first_step=False,
                  eps_decay=0.2, eps_steps=8,
                  val_monitor='accuracy',
-                 feature_groups=None):
+                 feature_groups=None,
+                 unbiased_target=False,
+                 y_target=None,
+                 init_scores=None,
+                 fast_knn=False,
+                 stop_patience=None):
         super().__init__()
         self.value_network = value_network
         self.predictor = predictor
         self.mask_layer = mask_layer
         self.register_buffer('X_train', X_train)
         self.register_buffer('y_train', y_train)
+        # Labels used inside the kNN target (default: the observed labels).  Passing
+        # decision-region labels (e.g. the predictor's full-feature argmax) makes the
+        # Gini term estimate p(R_y | .) instead of p(y | .), as EC2 prescribes.
+        self.register_buffer('y_target', (y_target if y_target is not None else y_train).clone())
+        self.unbiased_target = unbiased_target
+        self.fast_knn = fast_knn
+        # Stop once the validation metric has not improved for this many epochs
+        # (None: only the epsilon-annealing schedule stops training).
+        self.stop_patience = stop_patience
+        if init_scores is not None:
+            self.register_buffer('init_scores', init_scores.float())
+            _anchor_value_network(self.value_network, self.init_scores)
         self.register_buffer('feat_thresholds', feat_thresholds)
         self.register_buffer('feat_mean', torch.tensor(feat_mean, dtype=torch.float32))
         self.register_buffer('feat_std',  torch.tensor(feat_std,  dtype=torch.float32))
@@ -454,6 +604,13 @@ class EC2Estimator(pl.LightningModule):
         else:
             self.n_groups = self.mask_size
 
+    def on_load_checkpoint(self, checkpoint):
+        # Re-apply the empty-state anchor for checkpoints trained with lookahead_init.
+        sd = checkpoint.get("state_dict", {})
+        if "init_scores" in sd and not hasattr(self, "init_scores"):
+            self.register_buffer("init_scores", sd["init_scores"].clone().float())
+            _anchor_value_network(self.value_network, self.init_scores)
+
     def _col_scores_to_group_scores(self, pred_ec2, mask):
         """Aggregate per-column EC2 scores to per-group scores (min over group columns)."""
         penalized = pred_ec2 + 1e6 * mask  # already-observed cols → +inf
@@ -483,10 +640,11 @@ class EC2Estimator(pl.LightningModule):
             bin_oh_g.scatter_(-1, bin_indices_g.unsqueeze(-1), 1.0)
             
             labels_oh_g = torch.zeros(N, num_classes, device=self.device)
-            labels_oh_g.scatter_(1, self.y_train.unsqueeze(1).long(), 1.0)
+            labels_oh_g.scatter_(1, self.y_target.unsqueeze(1).long(), 1.0)
             bin_counts_g  = torch.einsum('nc,ndp->cdp', labels_oh_g, bin_oh_g)
             bin_totals_g  = bin_oh_g.sum(dim=0)
-            global_ec2 = _ec2_scores_from_bin_counts(bin_counts_g, bin_totals_g, N)
+            global_ec2 = _ec2_scores_from_bin_counts(bin_counts_g, bin_totals_g, N,
+                                                     self.unbiased_target)
         self.register_buffer('global_ec2_cache', global_ec2)           # [d_in]
         self.register_buffer('bin_oh_train', bin_oh_g.bool())          # [N, d_in, n_bins]
 
@@ -495,12 +653,14 @@ class EC2Estimator(pl.LightningModule):
         if self.knn_subsample is not None and self.knn_subsample < N:
             perm = torch.randperm(N, device=self.device)[:self.knn_subsample]
             self.register_buffer('X_train_knn', self.X_train[perm])
-            self.register_buffer('y_train_knn', self.y_train[perm])
+            self.register_buffer('y_train_knn', self.y_target[perm])
             self.register_buffer('bin_oh_train_knn', bin_oh_g[perm].bool())
         else:
             self.register_buffer('X_train_knn', self.X_train)
-            self.register_buffer('y_train_knn', self.y_train)
+            self.register_buffer('y_train_knn', self.y_target)
             self.register_buffer('bin_oh_train_knn', bin_oh_g.bool())
+        self.X_train_knn_sq = (self.X_train_knn ** 2) if self.fast_knn else None
+        self._best_metric, self._epochs_since_best = -float("inf"), 0
 
     def on_train_epoch_start(self):
         self._train_step_outputs = []
@@ -543,6 +703,8 @@ class EC2Estimator(pl.LightningModule):
                 x, mask, self.X_train_knn, self.y_train_knn, self.feat_thresholds, k=self.k,
                 global_ec2_cache=self.global_ec2_cache,
                 bin_oh_train=self.bin_oh_train_knn,
+                unbiased=self.unbiased_target,
+                X_train_sq=self.X_train_knn_sq,
             )  # [B, d_in]
 
             unobserved = (mask == 0).float()  # [B, d_in]
@@ -639,6 +801,14 @@ class EC2Estimator(pl.LightningModule):
 
         primary_metric = torch.tensor(auroc_mean) if self.val_monitor == 'auroc' else pred_acc_mean
 
+        if self.stop_patience is not None and not self.trainer.sanity_checking:
+            if float(primary_metric) > self._best_metric:
+                self._best_metric, self._epochs_since_best = float(primary_metric), 0
+            else:
+                self._epochs_since_best += 1
+                if self._epochs_since_best >= self.stop_patience:
+                    self.trainer.should_stop = True
+
         sch = self.lr_schedulers()
         if sch is not None:
             sch.step(primary_metric)
@@ -684,3 +854,92 @@ def build_trainer(max_epochs, logger, callbacks, gpu_index=0, precision=32):
         num_sanity_val_steps=0,
         callbacks=callbacks,
     )
+
+
+def _policy_masks(est, x, n_steps):
+    """Greedy masks of the trained value network: list of n_steps + 1 masks (budget 0..n_steps)."""
+    mask = torch.zeros_like(x)
+    masks = [mask]
+    with torch.no_grad():
+        for _ in range(n_steps):
+            pred_ec2 = est.value_network(est.mask_layer(x, mask))
+            if est.feature_groups is not None:
+                best = torch.argmin(est._col_scores_to_group_scores(pred_ec2, mask), dim=1)
+                mask = est._apply_group_action(mask, best)
+            else:
+                best = torch.argmin(pred_ec2 + 1e6 * mask, dim=1)
+                mask = torch.max(mask, ind_to_onehot(best, est.mask_size))
+            masks.append(mask)
+    return masks
+
+
+def finetune_predictor_on_policy(est, train_dl, val_dl, n_steps, device,
+                                 lr=1e-4, max_epochs=50, patience=5, random_mask_frac=0.25):
+    """Phase 3 (optional): fine-tune the predictor on the masks visited by the
+    learned greedy policy.  The value network -- and hence the acquisition
+    order -- is left untouched; only the classifier evaluated along the
+    trajectory changes.  A fraction of random masks is mixed in so that budgets
+    beyond the training horizon are not forgotten.  The predictor weights with
+    the best trajectory-mean validation metric (est.val_monitor) are kept.
+    """
+    est = est.to(device)
+    est.value_network.eval()
+    predictor = est.predictor
+    opt = optim.Adam(predictor.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    def val_metric():
+        predictor.eval()
+        per_step = [[] for _ in range(n_steps + 1)]
+        ys = []
+        with torch.no_grad():
+            for x, y in val_dl:
+                x, y = x.to(device), y.to(device)
+                for t, m in enumerate(_policy_masks(est, x, n_steps)):
+                    per_step[t].append(predictor(est.mask_layer(x, m)).softmax(1).cpu())
+                ys.append(y.cpu())
+        y = torch.cat(ys)
+        vals = []
+        for preds in per_step:
+            p = torch.cat(preds)
+            if est.val_monitor == 'auroc':
+                try:
+                    vals.append(roc_auc_score(y.numpy(), p[:, 1].numpy()) if p.shape[1] == 2
+                                else roc_auc_score(y.numpy(), p.numpy(), multi_class='ovr', average='macro'))
+                except ValueError:
+                    pass
+            else:
+                vals.append(multiclass_accuracy(p, y).item())
+        return float(np.mean(vals))
+
+    best = val_metric()
+    best_state = {k: v.detach().clone() for k, v in predictor.state_dict().items()}
+    print(f"[finetune] epoch 0  val {est.val_monitor} mean = {best:.4f}")
+    bad = 0
+    for epoch in range(1, max_epochs + 1):
+        predictor.train()
+        for x, y in train_dl:
+            x, y = x.to(device), y.to(device)
+            masks = _policy_masks(est, x, n_steps)
+            n_rand = max(1, int(round(random_mask_frac * len(masks))))
+            for _ in range(n_rand):
+                m = torch.rand_like(x) > torch.rand(len(x), 1, device=device)
+                masks.append(m.float())
+            xs = torch.cat([est.mask_layer(x, m) for m in masks])
+            loss = loss_fn(predictor(xs), y.repeat(len(masks)))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        v = val_metric()
+        print(f"[finetune] epoch {epoch}  val {est.val_monitor} mean = {v:.4f}")
+        if v > best:
+            best, bad = v, 0
+            best_state = {k: v_.detach().clone() for k, v_ in predictor.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    predictor.load_state_dict(best_state)
+    predictor.eval()
+    print(f"[finetune] kept predictor with val {est.val_monitor} mean = {best:.4f}")
+    return best

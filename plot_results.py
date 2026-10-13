@@ -45,7 +45,7 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
     
     # 读取该数据集所有 seed 的结果（默认配置 ec2_<ds>_seed<seed>）
     for seed in seeds:
-        run_name = f"ec2_{dataset_name}_seed{seed}"
+        run_name = f"ec2_{dataset_name}_main_seed{seed}"
         csv_path = os.path.join("logs", run_name, "eval_results.csv")
 
         if not os.path.exists(csv_path):
@@ -79,11 +79,24 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
                         value_name=metric.upper())
     
     # 替换策略名称使得图例更美观
-    ec2_label = 'EC2 (Ours)'
+    ec2_label = 'Deep-EC2'
     melted_df['Strategy'] = melted_df['Strategy'].map({
         target_metric: ec2_label,
         rand_metric: 'Random'
     })
+
+    # 最终配置 (按验证集选出, select_by_validation.py -> logs/ec2_<ds>_final_seed*)
+    final_rows = []
+    for seed in seeds:
+        csv_final = os.path.join("logs", f"ec2_{dataset_name}_NOFINALOVERLAY_seed{seed}", "eval_results.csv")
+        if os.path.exists(csv_final):
+            df_f = pd.read_csv(csv_final)
+            if target_metric in df_f.columns:
+                final_rows.append(pd.DataFrame({'budget': df_f['budget'], 'seed': seed,
+                                                'Strategy': 'Deep-EC2 (final)',
+                                                metric.upper(): df_f[target_metric]}))
+    if final_rows:
+        melted_df = pd.concat([melted_df] + final_rows, ignore_index=True)
 
     # 加载并合并 baselines
     baselines = load_baselines(dataset_name)
@@ -96,7 +109,8 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
         'iter': 'Iterative',
         'gdfs': 'GDFS',
         'aaco': 'AACO',
-        'dime': 'DIME'
+        'dime': 'DIME',
+        'ol': 'OL (RL)'
     }
     
     for name, data in baselines.items():
@@ -132,8 +146,15 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
     plt.figure(figsize=(8, 6))
     
     # 绘制折线图，Seaborn 会自动计算多个 seed 的均值并用阴影画出置信区间(误差带)
-    sns.lineplot(data=melted_df, x='budget', y=metric.upper(), 
-                 hue='Strategy', style='Strategy', markers=True, dashes=False)
+    order = ['Deep-EC2 (final)', ec2_label] + [x for x in melted_df['Strategy'].unique()
+                                               if x not in ('Deep-EC2 (final)', ec2_label)]
+    order = [x for x in order if x in set(melted_df['Strategy'])]
+    ax = sns.lineplot(data=melted_df, x='budget', y=metric.upper(),
+                      hue='Strategy', style='Strategy', markers=True, dashes=False,
+                      hue_order=order, style_order=order)
+    for line, name in zip(ax.get_lines(), order):
+        if name.startswith('Deep-EC2'):
+            line.set_linewidth(2.6)
     
     plt.title(f'Performance on {dataset_name.capitalize()} dataset', fontsize=14, pad=15)
     plt.xlabel('Feature Acquisition Budget', fontsize=12)
