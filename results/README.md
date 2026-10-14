@@ -104,3 +104,12 @@ Syn1/2/3 for all seeds (`figures/syn*_feature_order.png`; without the anchor:
 - `figures/syn{1,2,3}_feature_order.png`, `cube_nm_eval_feature_order.png`: acquisition order of the full method.
 - `tables/latex_main_table_{acc,auroc}.tex`, `latex_perbudget.tex`, `latex_ablation.tex`: thesis tables.
 - `tables/significance_results_{main,noanchor,twophase}.json`: per-method AUCs and paired tests.
+
+## Without the lookahead anchor (`figures_noanchor/`)
+
+Same figures for the variant with Phases 1–3 but no anchor (`noanchor` links: S5 `s5ft`
+runs on Syn/CUBE-NM, `ft` runs on the real-world data), used in the defence slides.
+Regenerate with `EC2_VARIANT=noanchor python plot_results.py`,
+`EC2_VARIANT=noanchor python plot_diff.py` and `sbatch run_analyze_syn_order_noanchor.sh`.
+Gate-first rate without the anchor: 1/3, 2/3, 3/3 seeds on Syn1/2/3.
+Training time (S5, SLURM wall-clock incl. evaluation): Syn 15–20 min (mean 17.5), CUBE-NM 7–9 min (mean 8.0).

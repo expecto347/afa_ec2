@@ -4,6 +4,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# EC2_VARIANT=<tag> plots logs/ec2_<ds>_<tag>_seed<s> (default: main); non-main tags get a file suffix.
+VARIANT = os.environ.get('EC2_VARIANT', 'main')
+
 # 注: 2026-08 HPS 搜索得到的最佳组合 (mnist (20,4), miniboone (5,20), ...) 仅 seed 0 有结果；
 # 为保持 3-seed 曲线配置一致，这里统一绘制默认配置的 ec2_<ds>_seed{0,1,2} 结果。
 
@@ -45,7 +48,7 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
     
     # 读取该数据集所有 seed 的结果（默认配置 ec2_<ds>_seed<seed>）
     for seed in seeds:
-        run_name = f"ec2_{dataset_name}_main_seed{seed}"
+        run_name = f"ec2_{dataset_name}_{VARIANT}_seed{seed}"
         csv_path = os.path.join("logs", run_name, "eval_results.csv")
 
         if not os.path.exists(csv_path):
@@ -162,7 +165,8 @@ def plot_dataset_curves(dataset_name, seeds=[0, 1, 2], metric='acc'):
     
     # 保存图像
     os.makedirs('figure', exist_ok=True)
-    output_filename = os.path.join('figure', f'{dataset_name}_{metric}_curve.png')
+    suffix = '' if VARIANT == 'main' else f'_{VARIANT}'
+    output_filename = os.path.join('figure', f'{dataset_name}_{metric}_curve{suffix}.png')
     plt.savefig(output_filename, dpi=300, bbox_inches='tight')
     plt.close()
     
