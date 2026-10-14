@@ -13,3 +13,4 @@ slurm-*.out
 figure/
 !results/figures/*.png
 unpin_ganymede.sh
+!results/figures_noanchor/*.png
